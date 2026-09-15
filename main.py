@@ -1377,6 +1377,13 @@ def main():
                     "Agar Render/Replit'dan boshqa joyda ishlatsangiz, "
                     "WEBAPP_URL environment variable'ni qo'lda qo'shing.")
 
+    # Python 3.13+ da asyncio.get_event_loop() asosiy oqimda ham avtomatik
+    # event loop yaratmay qo'ydi — buni qo'lda ochib beramiz, shunda PTB
+    # (python-telegram-bot) qaysi Python versiyasida ham ishlayveradi.
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     a = Application.builder().token(BOT_TOKEN).build()
     a.add_handler(CommandHandler("start", cmd_start))
     a.add_handler(CommandHandler("admin", cmd_admin))
