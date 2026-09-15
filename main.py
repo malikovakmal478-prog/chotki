@@ -459,8 +459,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(
         "🎮 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]]) if WEBAPP_URL else None
     await update.message.reply_text(txt, reply_markup=kb)
-    if main_kb():
-        await update.message.reply_text("Menyu tayyor 👇", reply_markup=main_kb())
 
 
 async def cb_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1155,14 +1153,75 @@ const GRADS = ['#ff5e62,#ff9966','#00c6ff,#0072ff','#f7971e,#ffd200','#8e2de2,#4
                '#11998e,#38ef7d','#ee0979,#ff6a00','#396afc,#2948ff','#fc4a1a,#f7b733'];
 function grad(seed){let h=0;for(let i=0;i<seed.length;i++)h=(h*31+seed.charCodeAt(i))>>>0;
   return GRADS[h%GRADS.length];}
-function thumb(g,sz){
-  sz = sz || '100%';
-  if(g.image && g.image.startsWith('http'))
-    return `<img src="${g.image}" style="width:${sz};aspect-ratio:1;object-fit:cover;border-radius:16px" onerror="this.outerHTML=thumbFallback('${g.title.replace(/'/g,"\\'")}','${g.image}')">`;
-  return `<div style="width:${sz};aspect-ratio:1;border-radius:16px;display:grid;place-items:center;font-size:34px;background:linear-gradient(135deg,${grad(g.title)})">${g.image||'🎮'}</div>`;
+
+/* Har bir o'yin turi uchun original (tashqi serverga bog'liq bo'lmagan) SVG belgi */
+const ART = [
+ {m:/free ?fire/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
+   <defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+     <stop offset="0" stop-color="#ff5e3a"/><stop offset="1" stop-color="#ff2d55"/></linearGradient></defs>
+   <rect width="100" height="100" rx="20" fill="url(#g1)"/>
+   <path d="M50 16c-4 11-16 15-16 30a16 16 0 0032 0c0-9-6-11-7-18 2 3 5 7 5 11a9 9 0 01-18 0c0-10 7-15 4-23z" fill="#fff"/>
+   <path d="M50 16c-4 11-16 15-16 30a16 16 0 0032 0c0-9-6-11-7-18 2 3 5 7 5 11a9 9 0 01-18 0c0-10 7-15 4-23z" fill="#ffd200" opacity=".55" transform="translate(0,4) scale(.72)" style="transform-origin:50px 62px"/>
+   <circle cx="76" cy="22" r="6" fill="#fff" opacity=".9"/></svg>`},
+ {m:/pubg/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
+   <defs><linearGradient id="g2" x1="0" y1="0" x2="1" y2="1">
+     <stop offset="0" stop-color="#4b6043"/><stop offset="1" stop-color="#1f2921"/></linearGradient></defs>
+   <rect width="100" height="100" rx="20" fill="url(#g2)"/>
+   <circle cx="50" cy="50" r="27" fill="none" stroke="#ffd452" stroke-width="4"/>
+   <circle cx="50" cy="50" r="14" fill="none" stroke="#ffd452" stroke-width="2.5" opacity=".7"/>
+   <line x1="50" y1="10" x2="50" y2="26" stroke="#ffd452" stroke-width="4"/>
+   <line x1="50" y1="74" x2="50" y2="90" stroke="#ffd452" stroke-width="4"/>
+   <line x1="10" y1="50" x2="26" y2="50" stroke="#ffd452" stroke-width="4"/>
+   <line x1="74" y1="50" x2="90" y2="50" stroke="#ffd452" stroke-width="4"/>
+   <circle cx="50" cy="50" r="5" fill="#ffd452"/></svg>`},
+ {m:/standoff/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
+   <defs><linearGradient id="g3" x1="0" y1="0" x2="1" y2="1">
+     <stop offset="0" stop-color="#8e0e00"/><stop offset="1" stop-color="#1c1c1c"/></linearGradient></defs>
+   <rect width="100" height="100" rx="20" fill="url(#g3)"/>
+   <circle cx="50" cy="50" r="23" fill="none" stroke="#fff" stroke-width="3" opacity=".92"/>
+   <line x1="50" y1="9" x2="50" y2="28" stroke="#fff" stroke-width="3"/>
+   <line x1="50" y1="72" x2="50" y2="91" stroke="#fff" stroke-width="3"/>
+   <line x1="9" y1="50" x2="28" y2="50" stroke="#fff" stroke-width="3"/>
+   <line x1="72" y1="50" x2="91" y2="50" stroke="#fff" stroke-width="3"/>
+   <circle cx="50" cy="50" r="4.5" fill="#ff3b3b"/></svg>`},
+ {m:/premium/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
+   <defs><linearGradient id="g4" x1="0" y1="0" x2="1" y2="1">
+     <stop offset="0" stop-color="#7f53ac"/><stop offset="1" stop-color="#2575fc"/></linearGradient></defs>
+   <rect width="100" height="100" rx="20" fill="url(#g4)"/>
+   <path d="M30 32h40l8 10-28 28-28-28z" fill="#fff" opacity=".95"/>
+   <path d="M30 32h40l8 10H22z" fill="#ffd23f"/>
+   <path d="M50 70l-13-28h26z" fill="#fff"/></svg>`},
+ {m:/stars?/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
+   <defs><linearGradient id="g5" x1="0" y1="0" x2="1" y2="1">
+     <stop offset="0" stop-color="#2AABEE"/><stop offset="1" stop-color="#1c74bb"/></linearGradient></defs>
+   <rect width="100" height="100" rx="20" fill="url(#g5)"/>
+   <path d="M50 18l8 18 19 2-14 13 4 19-17-10-17 10 4-19-14-13 19-2z" fill="#ffd23f"/></svg>`},
+ {m:/mobile ?legends|mlbb/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
+   <defs><linearGradient id="g6" x1="0" y1="0" x2="1" y2="1">
+     <stop offset="0" stop-color="#41295a"/><stop offset="1" stop-color="#2F0743"/></linearGradient></defs>
+   <rect width="100" height="100" rx="20" fill="url(#g6)"/>
+   <path d="M50 16l16 18-16 40-16-40z" fill="#7ee8fa"/>
+   <path d="M50 16l16 18h-32z" fill="#c8fbff" opacity=".8"/>
+   <line x1="50" y1="16" x2="50" y2="74" stroke="#fff" stroke-width="1.5" opacity=".5"/></svg>`},
+ {m:/genshin/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
+   <defs><linearGradient id="g7" x1="0" y1="0" x2="1" y2="1">
+     <stop offset="0" stop-color="#f7971e"/><stop offset="1" stop-color="#3a7bd5"/></linearGradient></defs>
+   <rect width="100" height="100" rx="20" fill="url(#g7)"/>
+   <circle cx="50" cy="50" r="24" fill="none" stroke="#fff" stroke-width="4"/>
+   <circle cx="50" cy="50" r="8" fill="#fff"/></svg>`},
+];
+function artFor(title, customEmoji){
+  const hit = ART.find(a=>a.m.test(title));
+  if(hit) return hit.svg;
+  const bg = grad(title);
+  return `<div style="width:100%;height:100%;display:grid;place-items:center;font-size:34px;
+    background:linear-gradient(135deg,${bg});border-radius:20px">${customEmoji||'🎮'}</div>`;
 }
-function thumbFallback(title,seedv){
-  return `<div style="width:100%;aspect-ratio:1;border-radius:16px;display:grid;place-items:center;font-size:34px;background:linear-gradient(135deg,${grad(seedv)})">🎮</div>`;
+function thumb(g){
+  if(g.image && g.image.startsWith('http'))
+    return `<img src="${g.image}" style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:20px" onerror="this.outerHTML=artFor('${g.title.replace(/'/g,"\\'")}')">`;
+  const emo = (g.image && !g.image.startsWith('http')) ? g.image : null;
+  return `<div style="aspect-ratio:1">${artFor(g.title, emo)}</div>`;
 }
 function gcard(g){return `<div class="g" onclick="openGame(${g.id})">
   ${thumb(g)}
@@ -1208,8 +1267,8 @@ async function openGame(id){
 function gamePage(){
   const g=ST.game;
   const heroBg = (g.image && g.image.startsWith('http'))
-    ? `<img src="${g.image}" style="width:100%;height:100%;object-fit:cover">`
-    : `<div style="width:100%;height:100%;display:grid;place-items:center;font-size:80px;background:linear-gradient(135deg,${grad(g.title)})">${g.image||'🎮'}</div>`;
+    ? `<img src="${g.image}" style="width:100%;height:100%;object-fit:cover" onerror="this.outerHTML=artFor('${g.title.replace(/'/g,"\\'")}')">`
+    : artFor(g.title, (g.image && !g.image.startsWith('http')) ? g.image : null);
   return `
   <div class="hero"><button class="back" onclick="go('games')">‹</button>
     ${heroBg}<h2>${g.title}</h2></div>
