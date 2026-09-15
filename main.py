@@ -131,27 +131,29 @@ def init_db():
 
 
 def seed():
+    # image maydoni: URL yoki oddiy emoji bo'lishi mumkin. Emoji bo'lsa
+    # frontend rangli belgi sifatida chizadi (tashqi rasm serveriga bog'liq emas).
     data = [
-        ("Free Fire (CIS)", "https://i.imgur.com/6mQF8Yl.png", "Olmoslar", 0, "Free Fire ID", [
+        ("Free Fire (CIS)", "🔥", "Olmoslar", 0, "Free Fire ID", [
             ("100 + 10 Diamonds", 9990, 12000), ("310 + 31 Diamonds", 30500, 35000),
             ("520 + 52 Diamonds", 49000, 55000), ("1060 + 106 Diamonds", 99000, 110000),
             ("2180 + 218 Diamonds", 197000, 220000), ("5600 + 560 Diamonds", 499000, 600000)]),
-        ("Free Fire (Lite)", "https://i.imgur.com/6mQF8Yl.png", "Olmoslar", 0, "Free Fire ID", [
+        ("Free Fire (Lite)", "🔥", "Olmoslar", 0, "Free Fire ID", [
             ("110 Diamonds", 11500, 13000), ("341 Diamonds", 33500, 38000),
             ("572 Diamonds", 54000, 60000), ("1166 Diamonds", 108000, 120000)]),
-        ("PUBGM (AUTO)", "https://i.imgur.com/0k2hQmZ.png", "UC", 0, "PUBG Mobile ID", [
+        ("PUBGM (AUTO)", "🎯", "UC", 0, "PUBG Mobile ID", [
             ("60 UC", 11000, 13000), ("325 UC", 57900, 65000),
             ("660 UC", 112900, 120000), ("1800 UC", 284900, 300000),
             ("3850 UC", 559900, 600000), ("8100 UC", 1119000, 1200000)]),
-        ("Telegram Stars", "https://i.imgur.com/1q3pGkQ.png", "Stars", 0, "Telegram username (@siz)", [
+        ("Telegram Stars", "⭐", "Stars", 0, "Telegram username (@siz)", [
             ("50 Stars", 12000, 14000), ("100 Stars", 23000, 26000),
             ("250 Stars", 56000, 62000), ("500 Stars", 110000, 125000)]),
-        ("Telegram Premium", "https://i.imgur.com/1q3pGkQ.png", "Obuna", 0, "Telegram username (@siz)", [
+        ("Telegram Premium", "✨", "Obuna", 0, "Telegram username (@siz)", [
             ("1 oy", 59000, 70000), ("3 oy", 149000, 175000), ("12 oy", 449000, 520000)]),
-        ("Standoff 2", "https://i.imgur.com/9Xh1L2s.png", "Gold", 0, "Standoff 2 ID", [
+        ("Standoff 2", "🔫", "Gold", 0, "Standoff 2 ID", [
             ("100 Gold", 14000, 16000), ("500 Gold", 66000, 75000),
             ("1000 Gold", 129000, 145000)]),
-        ("Mobile Legends", "https://i.imgur.com/8tM5o3P.png", "Olmoslar", 1, "MLBB ID", [
+        ("Mobile Legends", "💎", "Olmoslar", 1, "MLBB ID", [
             ("86 Diamonds", 22000, 25000), ("172 Diamonds", 43000, 48000),
             ("257 Diamonds", 64000, 71000), ("706 Diamonds", 170000, 190000)]),
     ]
@@ -627,9 +629,11 @@ async def cb_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if act == "gadd":
         ctx.user_data["aw"] = ("gadd",)
         return await edit(qy, "Yangi o'yin ma'lumotini yuboring:\n\n"
-                              "<code>Nomi | rasm_url | birlik | ID hint</code>\n\n"
-                              "Masalan:\n<code>Genshin Impact | https://i.imgur.com/x.png | "
-                              "Genesis | UID raqam</code>",
+                              "<code>Nomi | rasm (URL yoki emoji) | birlik | ID hint</code>\n\n"
+                              "Masalan (emoji bilan, tavsiya etiladi — hech qachon buzilmaydi):\n"
+                              "<code>Genshin Impact | 💠 | Genesis | UID raqam</code>\n\n"
+                              "Yoki URL bilan:\n"
+                              "<code>Genshin Impact | https://site.com/img.png | Genesis | UID raqam</code>",
                           InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data="a:games")]]))
 
     if act == "g":
@@ -1119,7 +1123,10 @@ async function boot(){
   if(!d.ok){V.innerHTML='<div class="empty"><div>🔒</div>Iltimos, botni Telegram orqali oching.</div>';return;}
   ST.user=d.user; ST.shop=d.shop; ST.games=d.games; ST.lang=d.user.lang||'uz';
   document.getElementById('uname').textContent=d.user.name;
-  document.getElementById('av').src = TG.initDataUnsafe?.user?.photo_url || 'https://i.imgur.com/6mQF8Yl.png';
+  const pu = TG.initDataUnsafe?.user?.photo_url;
+  if(pu) document.getElementById('av').src = pu;
+  else document.getElementById('av').outerHTML =
+    `<div id="av" class="av" style="display:grid;place-items:center;font-size:20px;background:linear-gradient(135deg,${grad(ST.user.name||'U')})">${(ST.user.name||'U')[0].toUpperCase()}</div>`;
   document.getElementById('langBtn').textContent='🌐 '+ST.lang.toUpperCase();
   if(d.subs && d.subs.length) return subsWall(d.subs);
   render();
@@ -1144,8 +1151,21 @@ function render(){
       || (ST.tab==='pay'&&b.dataset.t==='topup')));
   window.scrollTo(0,0);
 }
+const GRADS = ['#ff5e62,#ff9966','#00c6ff,#0072ff','#f7971e,#ffd200','#8e2de2,#4a00e0',
+               '#11998e,#38ef7d','#ee0979,#ff6a00','#396afc,#2948ff','#fc4a1a,#f7b733'];
+function grad(seed){let h=0;for(let i=0;i<seed.length;i++)h=(h*31+seed.charCodeAt(i))>>>0;
+  return GRADS[h%GRADS.length];}
+function thumb(g,sz){
+  sz = sz || '100%';
+  if(g.image && g.image.startsWith('http'))
+    return `<img src="${g.image}" style="width:${sz};aspect-ratio:1;object-fit:cover;border-radius:16px" onerror="this.outerHTML=thumbFallback('${g.title.replace(/'/g,"\\'")}','${g.image}')">`;
+  return `<div style="width:${sz};aspect-ratio:1;border-radius:16px;display:grid;place-items:center;font-size:34px;background:linear-gradient(135deg,${grad(g.title)})">${g.image||'🎮'}</div>`;
+}
+function thumbFallback(title,seedv){
+  return `<div style="width:100%;aspect-ratio:1;border-radius:16px;display:grid;place-items:center;font-size:34px;background:linear-gradient(135deg,${grad(seedv)})">🎮</div>`;
+}
 function gcard(g){return `<div class="g" onclick="openGame(${g.id})">
-  <img src="${g.image}" onerror="this.src='https://i.imgur.com/6mQF8Yl.png'">
+  ${thumb(g)}
   <span>${g.title}</span></div>`;}
 
 function home(){
@@ -1187,9 +1207,12 @@ async function openGame(id){
 }
 function gamePage(){
   const g=ST.game;
+  const heroBg = (g.image && g.image.startsWith('http'))
+    ? `<img src="${g.image}" style="width:100%;height:100%;object-fit:cover">`
+    : `<div style="width:100%;height:100%;display:grid;place-items:center;font-size:80px;background:linear-gradient(135deg,${grad(g.title)})">${g.image||'🎮'}</div>`;
   return `
   <div class="hero"><button class="back" onclick="go('games')">‹</button>
-    <img src="${g.image}" onerror="this.src='https://i.imgur.com/6mQF8Yl.png'"><h2>${g.title}</h2></div>
+    ${heroBg}<h2>${g.title}</h2></div>
   <div class="sec"><h4>${t('choose')}</h4></div>
   <div class="pk">${ST.packages.map(p=>{
     const d = p.old_price>p.price ? Math.round((1-p.price/p.old_price)*100) : 0;
@@ -1301,9 +1324,13 @@ function ordersHTML(){
 
 function profile(){
   const link=`https://t.me/${(TG.initDataUnsafe?.user?.username?'':'')}`;
+  const ppu = TG.initDataUnsafe?.user?.photo_url;
+  const bigAv = ppu
+    ? `<img class="av" style="width:96px;height:96px" src="${ppu}">`
+    : `<div class="av" style="width:96px;height:96px;margin:0 auto;display:grid;place-items:center;font-size:34px;background:linear-gradient(135deg,${grad(ST.user.name||'U')})">${(ST.user.name||'U')[0].toUpperCase()}</div>`;
   return `
   <div class="card" style="padding:20px;text-align:center">
-    <img class="av" style="width:96px;height:96px" src="${TG.initDataUnsafe?.user?.photo_url||'https://i.imgur.com/6mQF8Yl.png'}">
+    ${bigAv}
     <h3 style="margin:10px 0 4px;text-transform:uppercase">${ST.user.name}</h3>
     <div style="color:var(--mut);font-size:12px">ID: ${ST.user.id}</div>
     <div class="card bal" style="margin-top:14px"><div class="ico">👛</div>
