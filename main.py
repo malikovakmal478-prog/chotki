@@ -1,1549 +1,1329 @@
 # -*- coding: utf-8 -*-
 """
-DANAT SHOP uslubidagi o'yin hisobini to'ldirish boti + Telegram Mini App
-Bitta fayl: bot + Flask (Mini App) + SQLite + to'liq admin panel
+SYREXA - o'yin to'ldirish do'koni (Telegram bot + Mini App + to'liq admin panel)
+Bitta fayl. Render.com uchun tayyor.
 
-ENV:
-  BOT_TOKEN   = @BotFather tokeni
-  ADMINS      = 7849637859,123456789
-  WEBAPP_URL  = https://sizning-app.onrender.com
-  PORT        = 10000 (Render o'zi beradi)
+ENV (Render > Environment):
+  BOT_TOKEN   - BotFather tokeni
+  ADMIN_IDS   - admin Telegram ID lari, vergul bilan: 123456789,987654321
+  DB_PATH     - (ixtiyoriy) masalan /data/syrexa.db  (Render Disk ulangan bo'lsa)
+requirements.txt:
+  python-telegram-bot==21.6
+  Flask==3.0.3
+  requests==2.32.3
+Start command:  python main.py
 """
-
-import os, json, hmac, hashlib, sqlite3, threading, time, logging
-from urllib.parse import parse_qsl
+import os, re, json, base64, time, hmac, html, random, sqlite3, hashlib, asyncio, logging, threading, functools, urllib.parse
 from datetime import datetime
-
 import requests
 from flask import Flask, request, jsonify, Response
-from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
-                      ReplyKeyboardMarkup, KeyboardButton, WebAppInfo)
-from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
-                          MessageHandler, filters, ContextTypes)
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, MenuButtonWebApp)
+from telegram.error import BadRequest
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("danat")
+logging.getLogger("werkzeug").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("syrexa")
 
-BOT_TOKEN  = os.getenv("BOT_TOKEN", "").strip()
-ADMINS     = [int(x) for x in os.getenv("ADMINS", "7849637859").replace(" ", "").split(",") if x]
-# WEBAPP_URL ni qo'lda kiritish shart emas — Render/Replit o'z manzilini
-# avtomatik environment orqali beradi, shundan foydalanamiz.
-WEBAPP_URL = (
-    os.getenv("WEBAPP_URL", "").strip().rstrip("/")
-    or os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")   # Render avtomatik beradi
-    or (f"https://{os.getenv('REPL_SLUG')}.{os.getenv('REPL_OWNER')}.repl.co"
-        if os.getenv("REPL_SLUG") else "")                        # Replit avtomatik beradi
-)
-PORT       = int(os.getenv("PORT", "10000"))
-DB_PATH    = os.getenv("DB_PATH", "shop.db")
-API        = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TOKEN = os.getenv("BOT_TOKEN", "")
+OWNERS = [int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS", ""))]
+BASE_URL = (os.getenv("WEBAPP_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+PORT = int(os.getenv("PORT", "10000"))
+DB_PATH = os.getenv("DB_PATH", "syrexa.db")
+E = html.escape
 
-# ----------------------------------------------------------------------------
-# DB
-# ----------------------------------------------------------------------------
-LOCK = threading.Lock()
+# ============================ DATABASE ============================
+_lock = threading.RLock()
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
 
+SCHEMA = """
+create table if not exists users(id integer primary key,name text,username text,lang text default 'uz',balance integer default 0,banned integer default 0,joined integer);
+create table if not exists settings(k text primary key,v text);
+create table if not exists games(id integer primary key autoincrement,name text,cat text default 'game',img text default '',field text default 'Player ID',active integer default 1,sort integer default 0);
+create table if not exists products(id integer primary key autoincrement,game_id integer,name text,price integer,active integer default 1);
+create table if not exists banners(id integer primary key autoincrement,img text,link text default '');
+create table if not exists cards(id integer primary key autoincrement,number text,holder text,bank text default 'UZCARD',active integer default 1);
+create table if not exists topups(id integer primary key autoincrement,uid integer,amount integer,card_id integer,status text,created integer);
+create table if not exists orders(id integer primary key autoincrement,uid integer,game text,product text,price integer,player text,status text,created integer);
+create table if not exists promos(code text primary key,amount integer,left integer);
+create table if not exists promo_uses(code text,uid integer,primary key(code,uid));
+create table if not exists channels(id integer primary key autoincrement,chat_id text,title text,link text);
+create table if not exists admins(id integer primary key);
+create table if not exists files(id integer primary key autoincrement,mime text,data blob);
+"""
+DEFAULTS = {
+    "bot_name": "Syrexa",
+    "welcome_uz": "Xush kelibsiz, {name}! 👋\n\nSyrexa — o'yinlarni tez, ishonchli va xavfsiz to'ldirish xizmati.",
+    "welcome_ru": "Добро пожаловать, {name}! 👋\n\nSyrexa — быстрое, надёжное и безопасное пополнение игр.",
+    "support_link": "", "channel_link": "", "min_topup": "1000", "card_ttl": "5",
+    "welcome_img": "", "maintenance": "0",
+}
+SEED_GAMES = [("PUBG Mobile", "game"), ("Free Fire", "game"), ("Mobile Legends", "game"), ("Honor of Kings", "game"),
+              ("Standoff 2", "game"), ("Steam Top Up", "game"), ("Telegram Stars", "game"), ("Telegram Premium", "game"),
+              ("Bigo Live", "game"), ("Clash of Clans", "game"), ("Brawl Stars", "game"), ("Clash Royale", "game"),
+              ("Roblox Robux", "promo"), ("Discord Nitro", "promo")]
 
-def _con():
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def q(sql, args=(), one=False):
-    with LOCK:
-        con = _con()
-        rows = con.execute(sql, args).fetchall()
-        con.close()
-    if one:
-        return rows[0] if rows else None
-    return rows
-
-
-def x(sql, args=()):
-    with LOCK:
-        con = _con()
-        cur = con.execute(sql, args)
-        con.commit()
-        lid = cur.lastrowid
-        con.close()
-    return lid
-
+def ex(sql, args=()):
+    with _lock:
+        c = db.execute(sql, args); db.commit(); return c
+def qa(sql, args=()):
+    with _lock:
+        return [dict(r) for r in db.execute(sql, args).fetchall()]
+def q1(sql, args=()):
+    r = qa(sql, args); return r[0] if r else None
 
 def init_db():
-    with LOCK:
-        con = _con()
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY, name TEXT, username TEXT,
-            balance INTEGER DEFAULT 0, lang TEXT DEFAULT 'uz',
-            ref_by INTEGER DEFAULT 0, refs INTEGER DEFAULT 0,
-            banned INTEGER DEFAULT 0, created TEXT);
-        CREATE TABLE IF NOT EXISTS games(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, image TEXT,
-            unit TEXT DEFAULT 'Olmoslar', need_server INTEGER DEFAULT 0,
-            hint TEXT DEFAULT 'O''yin ID raqamingiz',
-            active INTEGER DEFAULT 1, sort INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS packages(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, game_id INTEGER, title TEXT,
-            price INTEGER, old_price INTEGER DEFAULT 0,
-            active INTEGER DEFAULT 1, sort INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS orders(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, game_id INTEGER,
-            pkg_id INTEGER, title TEXT, amount INTEGER, player_id TEXT,
-            server_id TEXT, status TEXT DEFAULT 'pending', created TEXT);
-        CREATE TABLE IF NOT EXISTS topups(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
-            method TEXT, status TEXT DEFAULT 'new', file_id TEXT, created TEXT);
-        CREATE TABLE IF NOT EXISTS promos(
-            code TEXT PRIMARY KEY, amount INTEGER, max_uses INTEGER DEFAULT 1,
-            used INTEGER DEFAULT 0, active INTEGER DEFAULT 1);
-        CREATE TABLE IF NOT EXISTS promo_uses(code TEXT, user_id INTEGER);
-        CREATE TABLE IF NOT EXISTS channels(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT, title TEXT, url TEXT);
-        CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
-        CREATE TABLE IF NOT EXISTS tx(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
-            note TEXT, created TEXT);
-        """)
-        con.commit()
-        con.close()
+    with _lock:
+        db.executescript(SCHEMA); db.commit()
+    for sql in ("alter table games add column hero text default ''", "alter table games add column picon text default ''",
+                "alter table games add column info text default ''", "alter table products add column img text default ''",
+                "alter table products add column grp text default ''", "alter table products add column badge text default ''"):
+        try: ex(sql)
+        except Exception: pass
+    if not q1("select 1 x from games"):
+        for i, (n, c) in enumerate(SEED_GAMES):
+            ex("insert into games(name,cat,sort) values(?,?,?)", (n, c, i))
 
-    defaults = {
-        "card_number": "5614 6831 1776 7954",
-        "card_holder": "S MAMAZHONOVA",
-        "card_type": "UZCARD",
-        "card2_number": "9860 0101 0101 0101",
-        "card2_holder": "S MAMAZHONOVA",
-        "min_topup": "1000",
-        "ref_bonus": "500",
-        "support": "Akmaljon1100",
-        "banner": "Eng yaxshi narxda — tez va ishonchli to'ldirish",
-        "shop_name": "DANAT SHOP",
-        "work": "24/7",
-    }
-    for k, v in defaults.items():
-        if not q("SELECT 1 FROM settings WHERE k=?", (k,), one=True):
-            x("INSERT INTO settings(k,v) VALUES(?,?)", (k, v))
+def gs(k):
+    r = q1("select v from settings where k=?", (k,))
+    return r["v"] if r else DEFAULTS.get(k, "")
+def ss(k, v):
+    ex("insert into settings(k,v) values(?,?) on conflict(k) do update set v=excluded.v", (k, str(v)))
 
-    if not q("SELECT 1 FROM games LIMIT 1", one=True):
-        seed()
-
-
-def seed():
-    # image maydoni: URL yoki oddiy emoji bo'lishi mumkin. Emoji bo'lsa
-    # frontend rangli belgi sifatida chizadi (tashqi rasm serveriga bog'liq emas).
-    data = [
-        ("Free Fire (CIS)", "🔥", "Olmoslar", 0, "Free Fire ID", [
-            ("100 + 10 Diamonds", 9990, 12000), ("310 + 31 Diamonds", 30500, 35000),
-            ("520 + 52 Diamonds", 49000, 55000), ("1060 + 106 Diamonds", 99000, 110000),
-            ("2180 + 218 Diamonds", 197000, 220000), ("5600 + 560 Diamonds", 499000, 600000)]),
-        ("Free Fire (Lite)", "🔥", "Olmoslar", 0, "Free Fire ID", [
-            ("110 Diamonds", 11500, 13000), ("341 Diamonds", 33500, 38000),
-            ("572 Diamonds", 54000, 60000), ("1166 Diamonds", 108000, 120000)]),
-        ("PUBGM (AUTO)", "🎯", "UC", 0, "PUBG Mobile ID", [
-            ("60 UC", 11000, 13000), ("325 UC", 57900, 65000),
-            ("660 UC", 112900, 120000), ("1800 UC", 284900, 300000),
-            ("3850 UC", 559900, 600000), ("8100 UC", 1119000, 1200000)]),
-        ("Telegram Stars", "⭐", "Stars", 0, "Telegram username (@siz)", [
-            ("50 Stars", 12000, 14000), ("100 Stars", 23000, 26000),
-            ("250 Stars", 56000, 62000), ("500 Stars", 110000, 125000)]),
-        ("Telegram Premium", "✨", "Obuna", 0, "Telegram username (@siz)", [
-            ("1 oy", 59000, 70000), ("3 oy", 149000, 175000), ("12 oy", 449000, 520000)]),
-        ("Standoff 2", "🔫", "Gold", 0, "Standoff 2 ID", [
-            ("100 Gold", 14000, 16000), ("500 Gold", 66000, 75000),
-            ("1000 Gold", 129000, 145000)]),
-        ("Mobile Legends", "💎", "Olmoslar", 1, "MLBB ID", [
-            ("86 Diamonds", 22000, 25000), ("172 Diamonds", 43000, 48000),
-            ("257 Diamonds", 64000, 71000), ("706 Diamonds", 170000, 190000)]),
-    ]
-    for i, (t, img, unit, ns, hint, pkgs) in enumerate(data):
-        gid = x("INSERT INTO games(title,image,unit,need_server,hint,active,sort) VALUES(?,?,?,?,?,1,?)",
-                (t, img, unit, ns, hint, i))
-        for j, (pt, pr, op) in enumerate(pkgs):
-            x("INSERT INTO packages(game_id,title,price,old_price,active,sort) VALUES(?,?,?,?,1,?)",
-              (gid, pt, pr, op, j))
-
-
-def S(k, d=""):
-    r = q("SELECT v FROM settings WHERE k=?", (k,), one=True)
-    return r["v"] if r else d
-
-
-def setS(k, v):
-    x("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=?", (k, str(v), str(v)))
-
-
-def get_user(uid):
-    return q("SELECT * FROM users WHERE id=?", (uid,), one=True)
-
-
-def add_user(uid, name, username, ref_by=0):
-    u = get_user(uid)
-    if u:
-        x("UPDATE users SET name=?,username=? WHERE id=?", (name, username, uid))
-        return False
-    x("INSERT INTO users(id,name,username,balance,lang,ref_by,created) VALUES(?,?,?,0,'uz',?,?)",
-      (uid, name, username, ref_by, datetime.now().isoformat(timespec="seconds")))
-    return True
-
-
-def balance_add(uid, amount, note=""):
-    x("UPDATE users SET balance=balance+? WHERE id=?", (int(amount), uid))
-    x("INSERT INTO tx(user_id,amount,note,created) VALUES(?,?,?,?)",
-      (uid, int(amount), note, datetime.now().isoformat(timespec="seconds")))
-
-
-def fmt(n):
+def all_admins():
+    return list(dict.fromkeys(OWNERS + [r["id"] for r in qa("select id from admins")]))
+def is_admin(uid):
+    return uid in all_admins()
+def money(n):
     return f"{int(n):,}".replace(",", " ")
+def ts(t):
+    return datetime.utcfromtimestamp(int(t) + 18000).strftime("%d.%m %H:%M")
+def link_ok(u):
+    return bool(u) and u.startswith(("https://", "http://", "tg://"))
 
-
-# ----------------------------------------------------------------------------
-# Telegram HTTP helper (Flask thread uchun)
-# ----------------------------------------------------------------------------
 def tg(method, **kw):
     try:
-        r = requests.post(f"{API}/{method}", json=kw, timeout=25)
-        return r.json()
+        return requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=kw, timeout=20).json()
     except Exception as e:
-        log.warning("tg %s: %s", method, e)
-        return {}
+        log.warning("tg %s: %s", method, e); return {}
 
+def notify(uid, text):
+    tg("sendMessage", chat_id=uid, text=text, parse_mode="HTML")
 
-def notify_admins(text, kb=None):
-    for a in ADMINS:
-        tg("sendMessage", chat_id=a, text=text, parse_mode="HTML",
-           reply_markup={"inline_keyboard": kb} if kb else None)
+def upsert_user(uid, name, username):
+    ex("insert or ignore into users(id,name,username,lang,balance,joined) values(?,?,?,?,0,?)",
+       (uid, name, username or "", "uz", int(time.time())))
+    ex("update users set name=?,username=? where id=?", (name, username or "", uid))
+    return q1("select * from users where id=?", (uid,))
 
+_subcache = {}
+def not_subbed(uid):
+    if is_admin(uid): return []
+    out = []
+    for ch in qa("select * from channels"):
+        key = (uid, ch["chat_id"]); c = _subcache.get(key)
+        if c and time.time() - c[0] < 45: ok = c[1]
+        else:
+            r = tg("getChatMember", chat_id=ch["chat_id"], user_id=uid)
+            st = r.get("result", {}).get("status") if r.get("ok") else "member"
+            ok = st in ("creator", "administrator", "member", "restricted")
+            _subcache[key] = (time.time(), ok)
+        if not ok: out.append(ch)
+    return out
 
-def check_subs(uid):
-    """Obuna bo'lmagan kanallar ro'yxatini qaytaradi."""
-    bad = []
-    for ch in q("SELECT * FROM channels"):
-        try:
-            r = requests.get(f"{API}/getChatMember",
-                             params={"chat_id": ch["chat_id"], "user_id": uid}, timeout=12).json()
-            st = r.get("result", {}).get("status")
-            if st not in ("creator", "administrator", "member"):
-                bad.append({"title": ch["title"], "url": ch["url"]})
-        except Exception:
-            pass
-    return bad
+def order_kb(oid):
+    return {"inline_keyboard": [[{"text": "✅ Bajarildi", "callback_data": f"o:done:{oid}"},
+                                 {"text": "❌ Bekor (qaytarish)", "callback_data": f"o:no:{oid}"}]]}
+def topup_kb(tid):
+    return {"inline_keyboard": [[{"text": "✅ Tasdiqlash", "callback_data": f"t:ok:{tid}"},
+                                 {"text": "❌ Rad etish", "callback_data": f"t:no:{tid}"}]]}
+def ulink(u):
+    return f'<a href="tg://user?id={u["id"]}">{E(u["name"] or str(u["id"]))}</a> (<code>{u["id"]}</code>)'
 
+# ============================ WEB API ============================
+web = Flask(__name__)
+web.config['MAX_CONTENT_LENGTH'] = 14 * 1024 * 1024
 
-# ----------------------------------------------------------------------------
-# Mini App auth
-# ----------------------------------------------------------------------------
-def verify(init_data):
+def auth():
+    init = request.headers.get("X-Init", "")
     try:
-        d = dict(parse_qsl(init_data, keep_blank_values=True))
-        h = d.pop("hash", None)
-        if not h:
-            return None
-        chk = "\n".join(f"{k}={d[k]}" for k in sorted(d))
-        sk = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        if hmac.new(sk, chk.encode(), hashlib.sha256).hexdigest() != h:
-            return None
-        return json.loads(d.get("user", "{}"))
+        data = dict(urllib.parse.parse_qsl(init, keep_blank_values=True))
+        h = data.pop("hash")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+        secret = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(hmac.new(secret, check.encode(), hashlib.sha256).hexdigest(), h): return None
+        if time.time() - int(data.get("auth_date", 0)) > 86400 * 7: return None
+        u = json.loads(data["user"])
     except Exception:
         return None
+    name = (u.get("first_name", "") + " " + u.get("last_name", "")).strip()
+    return upsert_user(int(u["id"]), name, u.get("username"))
 
+def need_user(f):
+    @functools.wraps(f)
+    def w(*a, **k):
+        u = auth()
+        if not u: return jsonify(err="auth"), 401
+        if u["banned"]: return jsonify(err="banned"), 403
+        if gs("maintenance") == "1" and not is_admin(u["id"]): return jsonify(err="maintenance"), 503
+        return f(u, *a, **k)
+    return w
 
-def who():
-    data = request.get_json(silent=True) or {}
-    u = verify(data.get("initData", ""))
-    if not u or not u.get("id"):
-        return None, data
-    uid = int(u["id"])
-    name = (u.get("first_name", "") + " " + u.get("last_name", "")).strip() or "User"
-    add_user(uid, name, u.get("username", ""))
-    return get_user(uid), data
-
-
-# ----------------------------------------------------------------------------
-# Flask / Mini App
-# ----------------------------------------------------------------------------
-app = Flask(__name__)
-
-
-@app.get("/")
+@web.route("/")
 def index():
-    return Response(HTML, mimetype="text/html")
+    r = Response(INDEX.replace("__BOT__", E(gs("bot_name"))), mimetype="text/html")
+    r.headers["Cache-Control"] = "no-store"; return r
 
-
-@app.get("/health")
+@web.route("/health")
 def health():
     return "ok"
 
+_imgdir = "/tmp/syrexa_img"; os.makedirs(_imgdir, exist_ok=True)
+@web.route("/img/<fid>")
+def img(fid):
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", fid): return "", 404
+    if re.fullmatch(r"f\d+", fid):
+        r = q1("select mime,data from files where id=?", (int(fid[1:]),))
+        if not r: return "", 404
+        return Response(r["data"], mimetype=r["mime"], headers={"Cache-Control": "public, max-age=604800, immutable"})
+    p = os.path.join(_imgdir, fid)
+    if not os.path.exists(p):
+        r = tg("getFile", file_id=fid)
+        fp = r.get("result", {}).get("file_path")
+        if not fp: return "", 404
+        try:
+            d = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", timeout=30).content
+            open(p, "wb").write(d)
+        except Exception:
+            return "", 404
+    data = open(p, "rb").read()
+    mt = "image/png" if data[:4] == b"\x89PNG" else "image/webp" if data[:4] == b"RIFF" else "image/jpeg"
+    return Response(data, mimetype=mt, headers={"Cache-Control": "public, max-age=86400"})
 
-@app.get("/media/game/<int:game_id>")
-def game_media(game_id):
-    """Telegram galereyasidan yuklangan o'yin rasmini Mini App'ga xavfsiz uzatadi."""
-    g = q("SELECT image FROM games WHERE id=?", (game_id,), one=True)
-    if not g or not g["image"] or not g["image"].startswith("tgfile:"):
-        return "Rasm topilmadi", 404
-    if not BOT_TOKEN:
-        return "Bot sozlanmagan", 503
-    file_id = g["image"][7:]
-    try:
-        meta = requests.get(f"{API}/getFile", params={"file_id": file_id}, timeout=15).json()
-        file_path = (meta.get("result") or {}).get("file_path")
-        if not meta.get("ok") or not file_path:
-            return "Telegram rasmni topmadi", 404
-        image_response = requests.get(
-            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}", timeout=25)
-        image_response.raise_for_status()
-        content_type = image_response.headers.get("Content-Type", "image/jpeg")
-        if not content_type.startswith("image/"):
-            content_type = "image/jpeg"
-        return Response(image_response.content, mimetype=content_type,
-                        headers={"Cache-Control": "public, max-age=3600"})
-    except Exception as e:
-        log.warning("Game image %s: %s", game_id, e)
-        return "Rasmni yuklab bo'lmadi", 502
+@web.route("/api/init")
+@need_user
+def api_init(u):
+    subs = [{"title": c["title"] or c["chat_id"], "link": c["link"]} for c in not_subbed(u["id"])]
+    return jsonify(
+        user={"id": u["id"], "name": u["name"], "username": u["username"], "lang": u["lang"],
+              "balance": u["balance"], "admin": is_admin(u["id"])},
+        banners=qa("select id,img,link from banners order by id"),
+        games=qa("select id,name,cat,img from games where active=1 order by sort,id"),
+        cfg={"support": gs("support_link"), "channel": gs("channel_link"), "min": int(gs("min_topup") or 1000),
+             "bot": gs("bot_name")}, sub=subs)
 
+@web.route("/api/game/<int:gid>")
+@need_user
+def api_game(u, gid):
+    g = q1("select id,name,img,hero,picon,info,field,cat from games where id=? and active=1", (gid,))
+    if not g: return jsonify(err="nf"), 404
+    g["products"] = qa("select id,name,price,img,grp,badge from products where game_id=? and active=1 order by id", (gid,))
+    for p in g["products"]: p["img"] = p["img"] or g["picon"]
+    inf = g.get("info") or ""
+    g["info"] = {"text": inf.split("|")[0].strip(), "link": inf.split("|")[1].strip() if "|" in inf else ""} if inf else None
+    return jsonify(g)
 
-@app.post("/api/init")
-def api_init():
-    u, _ = who()
-    if not u:
-        return jsonify(ok=False, error="auth"), 403
-    if u["banned"]:
-        return jsonify(ok=False, error="banned"), 403
-    return jsonify(ok=True,
-                   user=dict(id=u["id"], name=u["name"], balance=u["balance"],
-                             lang=u["lang"], refs=u["refs"]),
-                   subs=check_subs(u["id"]),
-                   shop=dict(name=S("shop_name"), banner=S("banner"),
-                             support=S("support"), min_topup=int(S("min_topup", "1000")),
-                             ref_bonus=int(S("ref_bonus", "500"))),
-                   games=[dict(r) for r in q(
-                       "SELECT * FROM games WHERE active=1 ORDER BY sort,id")])
+@web.route("/api/order", methods=["POST"])
+@need_user
+def api_order(u):
+    d = request.get_json(silent=True) or {}
+    player = str(d.get("player", "")).strip()[:100]
+    p = q1("select p.*,g.name gname from products p join games g on g.id=p.game_id where p.id=? and p.active=1 and g.active=1",
+           (int(d.get("product_id", 0)),))
+    if not p or len(player) < 2: return jsonify(err="bad"), 400
+    with _lock:
+        c = ex("update users set balance=balance-? where id=? and balance>=?", (p["price"], u["id"], p["price"]))
+        if c.rowcount == 0: return jsonify(err="balance"), 400
+        oid = ex("insert into orders(uid,game,product,price,player,status,created) values(?,?,?,?,?,'pending',?)",
+                 (u["id"], p["gname"], p["name"], p["price"], player, int(time.time()))).lastrowid
+    txt = (f"🛒 <b>Yangi buyurtma #{oid}</b>\n👤 {ulink(u)}\n🎮 {E(p['gname'])} — {E(p['name'])}\n"
+           f"🆔 ID: <code>{E(player)}</code>\n💰 {money(p['price'])} so'm")
+    for a in all_admins(): tg("sendMessage", chat_id=a, text=txt, parse_mode="HTML", reply_markup=order_kb(oid))
+    return jsonify(ok=True, id=oid, balance=q1("select balance from users where id=?", (u["id"],))["balance"])
 
+@web.route("/api/topup", methods=["POST"])
+@need_user
+def api_topup(u):
+    d = request.get_json(silent=True) or {}
+    try: amount = int(d.get("amount", 0))
+    except Exception: amount = 0
+    mn = int(gs("min_topup") or 1000)
+    if amount < mn or amount > 100000000: return jsonify(err="min", min=mn), 400
+    cards = qa("select * from cards where active=1")
+    if not cards: return jsonify(err="nocard"), 400
+    cd = random.choice(cards)
+    tid = ex("insert into topups(uid,amount,card_id,status,created) values(?,?,?,'new',?)",
+             (u["id"], amount, cd["id"], int(time.time()))).lastrowid
+    return jsonify(id=tid, amount=amount, ttl=int(gs("card_ttl") or 5) * 60,
+                   card={"number": cd["number"], "holder": cd["holder"], "bank": cd["bank"]})
 
-@app.post("/api/game")
-def api_game():
-    u, d = who()
-    if not u:
-        return jsonify(ok=False), 403
-    g = q("SELECT * FROM games WHERE id=?", (d.get("id"),), one=True)
-    if not g:
-        return jsonify(ok=False), 404
-    pk = q("SELECT * FROM packages WHERE game_id=? AND active=1 ORDER BY sort,id", (g["id"],))
-    return jsonify(ok=True, game=dict(g), packages=[dict(r) for r in pk])
-
-
-@app.post("/api/order")
-def api_order():
-    u, d = who()
-    if not u:
-        return jsonify(ok=False, error="auth"), 403
-    if check_subs(u["id"]):
-        return jsonify(ok=False, error="subs")
-    p = q("SELECT * FROM packages WHERE id=? AND active=1", (d.get("pkg_id"),), one=True)
-    if not p:
-        return jsonify(ok=False, error="Paket topilmadi")
-    g = q("SELECT * FROM games WHERE id=?", (p["game_id"],), one=True)
-    pid = (d.get("player_id") or "").strip()
-    sid = (d.get("server_id") or "").strip()
-    if len(pid) < 3:
-        return jsonify(ok=False, error="O'yin ID noto'g'ri")
-    if u["balance"] < p["price"]:
-        return jsonify(ok=False, error="Balans yetarli emas")
-
-    balance_add(u["id"], -p["price"], f"Buyurtma: {g['title']} {p['title']}")
-    oid = x("""INSERT INTO orders(user_id,game_id,pkg_id,title,amount,player_id,server_id,status,created)
-              VALUES(?,?,?,?,?,?,?, 'pending', ?)""",
-            (u["id"], g["id"], p["id"], f"{g['title']} — {p['title']}", p["price"],
-             pid, sid, datetime.now().isoformat(timespec="seconds")))
-
-    notify_admins(
-        f"🧾 <b>Yangi buyurtma #{oid}</b>\n\n"
-        f"👤 {u['name']} (<code>{u['id']}</code>) @{u['username'] or '-'}\n"
-        f"🎮 {g['title']}\n📦 {p['title']}\n"
-        f"🆔 <code>{pid}</code>{(' / ' + sid) if sid else ''}\n"
-        f"💵 {fmt(p['price'])} so'm",
-        [[{"text": "✅ Bajarildi", "callback_data": f"o:ok:{oid}"},
-          {"text": "❌ Rad etish", "callback_data": f"o:no:{oid}"}]])
-    tg("sendMessage", chat_id=u["id"],
-       text=f"✅ Buyurtma #{oid} qabul qilindi.\n🎮 {g['title']} — {p['title']}\n"
-            f"🆔 <code>{pid}</code>\n💵 {fmt(p['price'])} so'm\n\n⏳ Admin tasdiqlashini kuting.",
-       parse_mode="HTML")
-    return jsonify(ok=True, id=oid, balance=u["balance"] - p["price"])
-
-
-@app.post("/api/topup")
-def api_topup():
-    u, d = who()
-    if not u:
-        return jsonify(ok=False), 403
-    amount = int(d.get("amount") or 0)
-    mn = int(S("min_topup", "1000"))
-    if amount < mn:
-        return jsonify(ok=False, error=f"Eng kam summa {fmt(mn)} so'm")
-    method = d.get("method") or "UZCARD"
-    tid = x("INSERT INTO topups(user_id,amount,method,status,created) VALUES(?,?,?,'new',?)",
-            (u["id"], amount, method, datetime.now().isoformat(timespec="seconds")))
-    card = S("card_number") if method == "UZCARD" else S("card2_number")
-    holder = S("card_holder") if method == "UZCARD" else S("card2_holder")
-    tg("sendMessage", chat_id=u["id"],
-       text=f"💳 <b>To'lov #{tid}</b>\n\n"
-            f"Summa: <b>{fmt(amount)}</b> so'm\n"
-            f"Karta ({method}): <code>{card}</code>\n"
-            f"Egasi: {holder}\n\n"
-            f"👉 Pul o'tkazgach <b>chek skrinshotini shu yerga rasm qilib yuboring</b>.",
-       parse_mode="HTML")
-    return jsonify(ok=True, id=tid, card=card, holder=holder, method=method)
-
-
-@app.post("/api/orders")
-def api_orders():
-    u, _ = who()
-    if not u:
-        return jsonify(ok=False), 403
-    o = q("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 50", (u["id"],))
-    t = q("SELECT * FROM topups WHERE user_id=? ORDER BY id DESC LIMIT 50", (u["id"],))
-    return jsonify(ok=True, orders=[dict(r) for r in o], topups=[dict(r) for r in t])
-
-
-@app.post("/api/promo")
-def api_promo():
-    u, d = who()
-    if not u:
-        return jsonify(ok=False), 403
-    code = (d.get("code") or "").strip().upper()
-    p = q("SELECT * FROM promos WHERE code=? AND active=1", (code,), one=True)
-    if not p:
-        return jsonify(ok=False, error="Promokod topilmadi")
-    if p["used"] >= p["max_uses"]:
-        return jsonify(ok=False, error="Promokod limiti tugagan")
-    if q("SELECT 1 FROM promo_uses WHERE code=? AND user_id=?", (code, u["id"]), one=True):
-        return jsonify(ok=False, error="Siz bu promokodni ishlatgansiz")
-    balance_add(u["id"], p["amount"], f"Promokod {code}")
-    x("UPDATE promos SET used=used+1 WHERE code=?", (code,))
-    x("INSERT INTO promo_uses(code,user_id) VALUES(?,?)", (code, u["id"]))
-    return jsonify(ok=True, amount=p["amount"], balance=get_user(u["id"])["balance"])
-
-
-@app.post("/api/lang")
-def api_lang():
-    u, d = who()
-    if not u:
-        return jsonify(ok=False), 403
-    x("UPDATE users SET lang=? WHERE id=?", ((d.get("lang") or "uz")[:2], u["id"]))
+@web.route("/api/topup/<int:tid>/paid", methods=["POST"])
+@need_user
+def api_paid(u, tid):
+    c = ex("update topups set status='pending' where id=? and uid=? and status='new'", (tid, u["id"]))
+    if c.rowcount == 0: return jsonify(err="state"), 400
+    t = q1("select * from topups where id=?", (tid,))
+    cd = q1("select * from cards where id=?", (t["card_id"],)) or {}
+    txt = (f"💳 <b>To'ldirish so'rovi #{tid}</b>\n👤 {ulink(u)}\n💰 <b>{money(t['amount'])}</b> so'm\n"
+           f"🏦 Karta: <code>{E(cd.get('number',''))}</code> ({E(cd.get('holder',''))})\n🕒 {ts(t['created'])}\n\n"
+           f"Pul kartaga tushganini tekshiring, so'ng tasdiqlang.")
+    for a in all_admins(): tg("sendMessage", chat_id=a, text=txt, parse_mode="HTML", reply_markup=topup_kb(tid))
     return jsonify(ok=True)
 
+@web.route("/api/history")
+@need_user
+def api_history(u):
+    return jsonify(
+        orders=qa("select id,game,product,price,status,created from orders where uid=? order by id desc limit 50", (u["id"],)),
+        tx=qa("select id,amount,status,created from topups where uid=? and status!='new' order by id desc limit 50", (u["id"],)))
 
-@app.post("/api/top")
-def api_top():
-    u, _ = who()
-    if not u:
-        return jsonify(ok=False), 403
-    rows = q("""SELECT u.name, IFNULL(SUM(t.amount),0) s FROM users u
-                JOIN tx t ON t.user_id=u.id AND t.amount>0
-                GROUP BY u.id ORDER BY s DESC LIMIT 10""")
-    return jsonify(ok=True, top=[dict(r) for r in rows])
+@web.route("/api/promo", methods=["POST"])
+@need_user
+def api_promo(u):
+    code = str((request.get_json(silent=True) or {}).get("code", "")).strip().upper()
+    with _lock:
+        p = q1("select * from promos where code=?", (code,))
+        if not p or p["left"] <= 0: return jsonify(err="nf"), 400
+        if q1("select 1 x from promo_uses where code=? and uid=?", (code, u["id"])): return jsonify(err="used"), 400
+        ex("insert into promo_uses values(?,?)", (code, u["id"]))
+        ex("update promos set left=left-1 where code=?", (code,))
+        ex("update users set balance=balance+? where id=?", (p["amount"], u["id"]))
+    return jsonify(ok=True, amount=p["amount"], balance=q1("select balance from users where id=?", (u["id"],))["balance"])
 
+@web.route("/api/lang", methods=["POST"])
+@need_user
+def api_lang(u):
+    l = (request.get_json(silent=True) or {}).get("lang")
+    if l in ("uz", "ru"): ex("update users set lang=? where id=?", (l, u["id"]))
+    return jsonify(ok=True)
 
-# ----------------------------------------------------------------------------
-# BOT — foydalanuvchi
-# ----------------------------------------------------------------------------
-def main_kb():
-    if WEBAPP_URL:
-        return ReplyKeyboardMarkup(
-            [[KeyboardButton("🛍 Do'kon", web_app=WebAppInfo(url=WEBAPP_URL))]],
-            resize_keyboard=True)
-    return None
+# ============================ ADMIN WEB API (Mini App ichidagi panel) ============================
+def _i(v):
+    try: return int(float(str(v).replace(" ", "") or 0))
+    except Exception: return 0
 
+def need_admin(f):
+    @functools.wraps(f)
+    def w(*a, **k):
+        u = auth()
+        if not u or not is_admin(u["id"]): return jsonify(err="forbidden"), 403
+        return f(u, *a, **k)
+    return w
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    ref = 0
-    if ctx.args and ctx.args[0].startswith("ref"):
-        try:
-            ref = int(ctx.args[0][3:].replace("_", ""))
-        except Exception:
-            ref = 0
-    new = add_user(u.id, u.full_name, u.username or "", ref if ref != u.id else 0)
-    if new and ref and ref != u.id and get_user(ref):
-        b = int(S("ref_bonus", "500"))
-        balance_add(ref, b, f"Referal: {u.id}")
-        x("UPDATE users SET refs=refs+1 WHERE id=?", (ref,))
-        await ctx.bot.send_message(ref, f"🎉 Yangi do'st qo'shildi! +{fmt(b)} so'm bonus.")
+COLS = {
+    "games": (["name", "cat", "img", "hero", "picon", "info", "field", "active", "sort"], ["active", "sort"]),
+    "products": (["game_id", "name", "price", "grp", "badge", "img", "active"], ["game_id", "price", "active"]),
+    "banners": (["img", "link"], []),
+    "cards": (["number", "holder", "bank", "active"], ["active"]),
+    "channels": (["chat_id", "title", "link"], []),
+}
 
-    bad = check_subs(u.id)
-    if bad:
-        kb = [[InlineKeyboardButton("📢 " + c["title"], url=c["url"])] for c in bad]
-        kb.append([InlineKeyboardButton("✅ Tekshirish", callback_data="chk")])
-        await update.message.reply_text(
-            "Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:",
-            reply_markup=InlineKeyboardMarkup(kb))
-        return
+def decide_topup(tid, ok):
+    t = q1("select * from topups where id=?", (tid,))
+    if not t: return "Topilmadi"
+    c = ex("update topups set status=? where id=? and status in ('new','pending')", ("approved" if ok else "rejected", tid))
+    if not c.rowcount: return "Allaqachon ko'rilgan"
+    if ok:
+        ex("update users set balance=balance+? where id=?", (t["amount"], t["uid"]))
+        notify(t["uid"], f"✅ Balansingiz <b>{money(t['amount'])}</b> so'mga to'ldirildi.")
+        return "✅ Tasdiqlandi"
+    notify(t["uid"], f"❌ {money(t['amount'])} so'm to'ldirish so'rovi rad etildi.")
+    return "❌ Rad etildi"
 
-    txt = (f"Salom, {u.first_name}! 👋\n\n"
-           f"{S('shop_name')} — o'yin hisobingizni tez va xavfsiz to'ldirish xizmati.\n\n"
-           f"Boshlash uchun pastdagi tugmani bosing 👇")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-        "🎮 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]]) if WEBAPP_URL else None
-    await update.message.reply_text(txt, reply_markup=kb)
+def decide_order(oid, ok):
+    o = q1("select * from orders where id=?", (oid,))
+    if not o: return "Topilmadi"
+    c = ex("update orders set status=? where id=? and status='pending'", ("done" if ok else "canceled", oid))
+    if not c.rowcount: return "Allaqachon ko'rilgan"
+    if ok:
+        notify(o["uid"], f"✅ Buyurtma #{oid} bajarildi!\n🎮 {E(o['game'])} — {E(o['product'])}")
+        return "✅ Bajarildi"
+    ex("update users set balance=balance+? where id=?", (o["price"], o["uid"]))
+    notify(o["uid"], f"❌ Buyurtma #{oid} bekor qilindi, <b>{money(o['price'])}</b> so'm balansga qaytarildi.")
+    return "❌ Bekor qilindi, pul qaytarildi"
 
+@web.route("/api/a/data/<name>")
+@need_admin
+def a_data(u, name):
+    gid = request.args.get("id", type=int); s = request.args.get("q", "").strip()
+    if name == "home":
+        d0 = (int(time.time()) + 18000) // 86400 * 86400 - 18000
+        n = q1("select count(*) c, coalesce(sum(balance),0) b from users")
+        tp = q1("select coalesce(sum(amount),0) s from topups where status='approved'")["s"]
+        tt = q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=?", (d0,))["s"]
+        od = q1("select count(*) c, coalesce(sum(price),0) s from orders where status='done'")
+        return jsonify(users=n["c"], bal=n["b"], new=q1("select count(*) c from users where joined>=?", (d0,))["c"],
+                       top_sum=tp, top_today=tt, ord_cnt=od["c"], ord_sum=od["s"],
+                       p_top=q1("select count(*) c from topups where status='pending'")["c"],
+                       p_ord=q1("select count(*) c from orders where status='pending'")["c"])
+    if name == "games":
+        return jsonify(games=qa("select g.*,(select count(*) from products where game_id=g.id) pc from games g order by sort,id"))
+    if name == "game":
+        return jsonify(game=q1("select * from games where id=?", (gid,)),
+                       products=qa("select * from products where game_id=? order by id", (gid,)))
+    if name == "banners": return jsonify(items=qa("select * from banners order by id"))
+    if name == "cards": return jsonify(items=qa("select * from cards order by id"))
+    if name == "users":
+        if s.isdigit(): rows = qa("select * from users where id=? or name like ? limit 30", (int(s), f"%{s}%"))
+        elif s: rows = qa("select * from users where name like ? or username like ? limit 30", (f"%{s}%", f"%{s.lstrip('@')}%"))
+        else: rows = qa("select * from users order by id desc limit 30")
+        return jsonify(items=rows)
+    if name == "tops":
+        return jsonify(items=qa("select t.*,u.name uname from topups t left join users u on u.id=t.uid where t.status!='new' order by (t.status='pending') desc, t.id desc limit 40"))
+    if name == "ords":
+        return jsonify(items=qa("select o.*,u.name uname from orders o left join users u on u.id=o.uid order by (o.status='pending') desc, o.id desc limit 40"))
+    if name == "promos": return jsonify(items=qa("select * from promos"))
+    if name == "chs": return jsonify(items=qa("select * from channels"))
+    if name == "set": return jsonify(s={k: gs(k) for k in DEFAULTS})
+    if name == "adms": return jsonify(items=all_admins(), owners=OWNERS)
+    if name == "bc": return jsonify(users=q1("select count(*) c from users where banned=0")["c"])
+    return jsonify(err="nf"), 404
 
-async def cb_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    qy = update.callback_query
-    bad = check_subs(qy.from_user.id)
-    if bad:
-        await qy.answer("Hali obuna bo'lmagansiz ❌", show_alert=True)
-        return
-    await qy.answer("Rahmat! ✅")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-        "🎮 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]]) if WEBAPP_URL else None
-    await qy.message.reply_text("Tayyor! Ilovani oching 👇", reply_markup=kb)
-
-
-async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin o'yin rasmi yoki foydalanuvchi to'lov chekini qabul qiladi."""
-    uid = update.effective_user.id
-    aw = ctx.user_data.get("aw")
-    if aw and aw[0] == "gimage" and is_admin(uid):
-        gid = int(aw[1])
-        fid = update.message.photo[-1].file_id
-        x("UPDATE games SET image=? WHERE id=?", ("tgfile:" + fid, gid))
-        ctx.user_data.pop("aw", None)
-        g = q("SELECT title FROM games WHERE id=?", (gid,), one=True)
-        await update.message.reply_text(
-            f"✅ <b>{g['title'] if g else 'Oʻyin'}</b> rasmi yangilandi!\n"
-            "Mini App'ni qayta oching yoki yangilang.", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                "🎮 Admin panel", callback_data=f"a:g:{gid}")]]))
-        return
-    if aw and is_admin(uid):
-        return await on_text(update, ctx)
-    if aw:
-        return
-
-    t = q("SELECT * FROM topups WHERE user_id=? AND status='new' ORDER BY id DESC LIMIT 1",
-          (uid,), one=True)
-    if not t:
-        await update.message.reply_text("Avval ilovadan to'ldirish so'rovini yarating.")
-        return
-    fid = update.message.photo[-1].file_id
-    x("UPDATE topups SET file_id=?, status='pending' WHERE id=?", (fid, t["id"]))
-    u = get_user(uid)
-    for a in ADMINS:
-        await ctx.bot.send_photo(
-            a, fid,
-            caption=(f"💰 <b>To'ldirish #{t['id']}</b>\n\n"
-                     f"👤 {u['name']} (<code>{uid}</code>) @{u['username'] or '-'}\n"
-                     f"💵 {fmt(t['amount'])} so'm\n💳 {t['method']}"),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"t:ok:{t['id']}"),
-                InlineKeyboardButton("❌ Rad etish", callback_data=f"t:no:{t['id']}")]]))
-    await update.message.reply_text("✅ Chek yuborildi. Admin tekshirgach balans yangilanadi.")
-
-
-async def cb_order(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    qy = update.callback_query
-    if qy.from_user.id not in ADMINS:
-        return await qy.answer("Ruxsat yo'q", show_alert=True)
-    _, act, oid = qy.data.split(":")
-    o = q("SELECT * FROM orders WHERE id=?", (oid,), one=True)
-    if not o or o["status"] != "pending":
-        return await qy.answer("Allaqachon ishlangan")
-    if act == "ok":
-        x("UPDATE orders SET status='done' WHERE id=?", (oid,))
-        await ctx.bot.send_message(o["user_id"],
-                                   f"✅ Buyurtma #{oid} bajarildi!\n{o['title']}")
-        await qy.edit_message_text(qy.message.text_html + "\n\n✅ <b>BAJARILDI</b>",
-                                   parse_mode="HTML")
+@web.route("/api/a/save/<t>", methods=["POST"])
+@need_admin
+def a_save(u, t):
+    d = request.get_json(silent=True) or {}
+    if t == "promos":
+        code = str(d.get("code", "")).strip().upper()
+        if not code or _i(d.get("amount")) <= 0: return jsonify(err="Kod va summani kiriting"), 400
+        ex("insert or replace into promos(code,amount,left) values(?,?,?)", (code, _i(d.get("amount")), _i(d.get("left")))); return jsonify(ok=True)
+    if t not in COLS: return jsonify(err="bad"), 400
+    cols, ints = COLS[t]; vals = {}
+    for c in cols:
+        if c in d: vals[c] = _i(d[c]) if c in ints else str(d[c] if d[c] is not None else "").strip()
+    if t == "games" and not vals.get("name"): return jsonify(err="Nom kiriting"), 400
+    if t == "products" and (not vals.get("name") or vals.get("price", 0) <= 0): return jsonify(err="Nom va narxni kiriting"), 400
+    if t == "banners" and not vals.get("img"): return jsonify(err="Rasm tanlang"), 400
+    if t == "cards" and "number" in vals:
+        dg = re.sub(r"\D", "", vals["number"])
+        if len(dg) < 12: return jsonify(err="Karta raqami noto'g'ri"), 400
+        vals["number"] = " ".join(dg[i:i+4] for i in range(0, len(dg), 4))
+    if t == "channels" and not d.get("id"):
+        r = tg("getChat", chat_id=vals.get("chat_id", ""))
+        if not r.get("ok"): return jsonify(err="Kanal topilmadi yoki bot u yerda admin emas"), 400
+        c = r["result"]; vals["chat_id"] = str(c["id"]); vals["title"] = c.get("title", "")
+        vals["link"] = f"https://t.me/{c['username']}" if c.get("username") else (c.get("invite_link") or tg("exportChatInviteLink", chat_id=c["id"]).get("result", ""))
+    if t == "games" and not d.get("id"): vals["sort"] = q1("select coalesce(max(sort),0)+1 m from games")["m"]
+    if not vals: return jsonify(err="bo'sh"), 400
+    if d.get("id"):
+        rid = int(d["id"])
+        ex(f"update {t} set {','.join(c + '=?' for c in vals)} where id=?", (*vals.values(), rid))
     else:
-        x("UPDATE orders SET status='rejected' WHERE id=?", (oid,))
-        balance_add(o["user_id"], o["amount"], f"Buyurtma #{oid} qaytarildi")
-        await ctx.bot.send_message(o["user_id"],
-                                   f"❌ Buyurtma #{oid} rad etildi.\n"
-                                   f"💰 {fmt(o['amount'])} so'm balansga qaytarildi.")
-        await qy.edit_message_text(qy.message.text_html + "\n\n❌ <b>RAD ETILDI</b>",
-                                   parse_mode="HTML")
-    await qy.answer()
+        rid = ex(f"insert into {t}({','.join(vals)}) values({','.join('?' * len(vals))})", tuple(vals.values())).lastrowid
+    return jsonify(ok=True, id=rid)
 
+@web.route("/api/a/del/<t>", methods=["POST"])
+@need_admin
+def a_del(u, t):
+    i = (request.get_json(silent=True) or {}).get("id")
+    if t == "promos": ex("delete from promos where code=?", (str(i),))
+    elif t == "games": ex("delete from products where game_id=?", (int(i),)); ex("delete from games where id=?", (int(i),))
+    elif t in COLS: ex(f"delete from {t} where id=?", (int(i),))
+    else: return jsonify(err="bad"), 400
+    return jsonify(ok=True)
 
-async def cb_topup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    qy = update.callback_query
-    if qy.from_user.id not in ADMINS:
-        return await qy.answer("Ruxsat yo'q", show_alert=True)
-    _, act, tid = qy.data.split(":")
-    t = q("SELECT * FROM topups WHERE id=?", (tid,), one=True)
-    if not t or t["status"] != "pending":
-        return await qy.answer("Allaqachon ishlangan")
-    if act == "ok":
-        x("UPDATE topups SET status='done' WHERE id=?", (tid,))
-        balance_add(t["user_id"], t["amount"], f"To'ldirish #{tid}")
-        nb = get_user(t["user_id"])["balance"]
-        await ctx.bot.send_message(t["user_id"],
-                                   f"✅ Balans to'ldirildi: +{fmt(t['amount'])} so'm\n"
-                                   f"💼 Yangi balans: {fmt(nb)} so'm")
-        await qy.edit_message_caption((qy.message.caption or "") + "\n\n✅ TASDIQLANDI")
-    else:
-        x("UPDATE topups SET status='rejected' WHERE id=?", (tid,))
-        await ctx.bot.send_message(t["user_id"],
-                                   f"❌ To'ldirish #{tid} rad etildi. Support: @{S('support')}")
-        await qy.edit_message_caption((qy.message.caption or "") + "\n\n❌ RAD ETILDI")
-    await qy.answer()
+@web.route("/api/a/bulk", methods=["POST"])
+@need_admin
+def a_bulk(u):
+    d = request.get_json(silent=True) or {}; n = 0
+    for line in str(d.get("text", "")).splitlines():
+        pt = [x.strip() for x in line.split("|")]
+        if len(pt) >= 2 and pt[0] and _i(pt[1]) > 0:
+            ex("insert into products(game_id,name,price,grp,badge) values(?,?,?,?,?)",
+               (int(d["game_id"]), pt[0], _i(pt[1]), pt[2] if len(pt) > 2 else "", pt[3] if len(pt) > 3 else "")); n += 1
+    if not n: return jsonify(err="Format: nom | narx | guruh | belgi"), 400
+    return jsonify(ok=True, n=n)
 
+@web.route("/api/a/upload", methods=["POST"])
+@need_admin
+def a_upload(u):
+    d = (request.get_json(silent=True) or {}).get("data", "")
+    m = re.match(r"data:(image/(?:jpeg|png|webp));base64,(.+)$", d, re.S)
+    if not m: return jsonify(err="Rasm formati noto'g'ri"), 400
+    raw = base64.b64decode(m.group(2))
+    if len(raw) > 6_000_000: return jsonify(err="Rasm juda katta"), 400
+    return jsonify(ref=f"f{ex('insert into files(mime,data) values(?,?)', (m.group(1), raw)).lastrowid}")
 
-# ----------------------------------------------------------------------------
-# ADMIN PANEL
-# ----------------------------------------------------------------------------
-def is_admin(uid):
-    return uid in ADMINS
-
-
-def adm_home_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Statistika", callback_data="a:stats"),
-         InlineKeyboardButton("🎮 O'yinlar", callback_data="a:games")],
-        [InlineKeyboardButton("💳 Karta", callback_data="a:card"),
-         InlineKeyboardButton("📢 Majburiy obuna", callback_data="a:subs")],
-        [InlineKeyboardButton("👤 Balans +/-", callback_data="a:bal"),
-         InlineKeyboardButton("🎟 Promokod", callback_data="a:promo")],
-        [InlineKeyboardButton("🧾 Buyurtmalar", callback_data="a:orders"),
-         InlineKeyboardButton("💰 To'ldirishlar", callback_data="a:tops")],
-        [InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="a:users"),
-         InlineKeyboardButton("📣 Reklama", callback_data="a:bcast")],
-        [InlineKeyboardButton("⚙️ Sozlamalar", callback_data="a:settings")],
-    ])
-
-
-async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    ctx.user_data.pop("aw", None)
-    await update.message.reply_text("🛠 <b>Admin panel</b>", parse_mode="HTML",
-                                    reply_markup=adm_home_kb())
-
-
-async def edit(qy, text, kb):
+@web.route("/api/a/import", methods=["POST"])
+@need_admin
+def a_import(u):
+    url = str((request.get_json(silent=True) or {}).get("url", "")).strip()
+    msg = "Havoladan rasm olinmadi. Rasm ustida «rasm manzilini nusxalash» qiling (.jpg/.png/.webp)"
+    if not url.startswith(("http://", "https://")): return jsonify(err=msg), 400
     try:
-        await qy.edit_message_text(text, parse_mode="HTML", reply_markup=kb,
-                                   disable_web_page_preview=True)
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
+        if r.status_code != 200 or ct not in ("image/jpeg", "image/png", "image/webp") or len(r.content) > 6_000_000:
+            return jsonify(err=msg), 400
     except Exception:
-        await qy.message.reply_text(text, parse_mode="HTML", reply_markup=kb,
-                                    disable_web_page_preview=True)
+        return jsonify(err=msg), 400
+    return jsonify(ref=f"f{ex('insert into files(mime,data) values(?,?)', (ct, r.content)).lastrowid}")
 
+@web.route("/api/a/set", methods=["POST"])
+@need_admin
+def a_set(u):
+    for k, v in (request.get_json(silent=True) or {}).items():
+        if k in DEFAULTS:
+            ss(k, re.sub(r"\D", "", str(v)) or DEFAULTS[k] if k in ("min_topup", "card_ttl") else str(v if v is not None else "").strip())
+    return jsonify(ok=True)
 
-async def cb_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    qy = update.callback_query
-    if not is_admin(qy.from_user.id):
-        return await qy.answer("Ruxsat yo'q", show_alert=True)
-    await qy.answer()
-    p = qy.data.split(":")
-    act = p[1]
-    back = InlineKeyboardButton("⬅️ Orqaga", callback_data="a:home")
+@web.route("/api/a/user", methods=["POST"])
+@need_admin
+def a_user(u):
+    d = request.get_json(silent=True) or {}; uid = int(d["id"]); amt = _i(d.get("amt"))
+    if amt > 0:
+        ex("update users set balance=max(0,balance+?) where id=?", (amt if d.get("op") == "add" else -amt, uid))
+        notify(uid, f"{'➕' if d.get('op') == 'add' else '➖'} Balansingiz o'zgardi: <b>{money(amt)}</b> so'm")
+    if "banned" in d: ex("update users set banned=? where id=?", (1 if _i(d["banned"]) else 0, uid))
+    return jsonify(ok=True)
 
-    if act == "home":
-        ctx.user_data.pop("aw", None)
-        return await edit(qy, "🛠 <b>Admin panel</b>", adm_home_kb())
+@web.route("/api/a/topup", methods=["POST"])
+@need_admin
+def a_topup(u):
+    d = request.get_json(silent=True) or {}; return jsonify(msg=decide_topup(int(d["id"]), _i(d.get("ok"))))
 
-    if act == "stats":
-        us = q("SELECT COUNT(*) c FROM users", one=True)["c"]
-        od = q("SELECT COUNT(*) c FROM orders WHERE status='done'", one=True)["c"]
-        op = q("SELECT COUNT(*) c FROM orders WHERE status='pending'", one=True)["c"]
-        sm = q("SELECT IFNULL(SUM(amount),0) s FROM orders WHERE status='done'", one=True)["s"]
-        tp = q("SELECT IFNULL(SUM(amount),0) s FROM topups WHERE status='done'", one=True)["s"]
-        bal = q("SELECT IFNULL(SUM(balance),0) s FROM users", one=True)["s"]
-        return await edit(qy,
-            f"📊 <b>Statistika</b>\n\n👥 Foydalanuvchi: <b>{us}</b>\n"
-            f"🧾 Bajarilgan buyurtma: <b>{od}</b>\n⏳ Kutilmoqda: <b>{op}</b>\n"
-            f"💵 Savdo: <b>{fmt(sm)}</b> so'm\n💰 To'ldirilgan: <b>{fmt(tp)}</b> so'm\n"
-            f"💼 Umumiy balans: <b>{fmt(bal)}</b> so'm",
-            InlineKeyboardMarkup([[back]]))
+@web.route("/api/a/order", methods=["POST"])
+@need_admin
+def a_order(u):
+    d = request.get_json(silent=True) or {}; return jsonify(msg=decide_order(int(d["id"]), _i(d.get("ok"))))
 
-    # ---------------- O'yinlar ----------------
-    if act == "games":
-        rows = q("SELECT * FROM games ORDER BY sort,id")
-        kb = [[InlineKeyboardButton(f"{'🟢' if g['active'] else '🔴'} {g['title']}",
-                                    callback_data=f"a:g:{g['id']}")] for g in rows]
-        kb.append([InlineKeyboardButton("➕ O'yin qo'shish", callback_data="a:gadd")])
-        kb.append([back])
-        return await edit(qy, "🎮 <b>O'yinlar</b>", InlineKeyboardMarkup(kb))
+@web.route("/api/a/admin", methods=["POST"])
+@need_admin
+def a_admin(u):
+    d = request.get_json(silent=True) or {}; i = _i(d.get("id"))
+    if not i: return jsonify(err="ID kiriting"), 400
+    if d.get("remove"):
+        if i not in OWNERS: ex("delete from admins where id=?", (i,))
+    else: ex("insert or ignore into admins values(?)", (i,))
+    return jsonify(ok=True)
 
-    if act == "gadd":
-        ctx.user_data["aw"] = ("gadd",)
-        return await edit(qy, "Yangi o'yin ma'lumotini yuboring:\n\n"
-                              "<code>Nomi | rasm (URL yoki emoji) | birlik | ID hint</code>\n\n"
-                              "Masalan (emoji bilan, tavsiya etiladi — hech qachon buzilmaydi):\n"
-                              "<code>Genshin Impact | 💠 | Genesis | UID raqam</code>\n\n"
-                              "Yoki URL bilan:\n"
-                              "<code>Genshin Impact | https://site.com/img.png | Genesis | UID raqam</code>",
-                          InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data="a:games")]]))
+def do_broadcast(text, img):
+    blob = None; fid = None
+    if img and re.fullmatch(r"f\d+", img):
+        r = q1("select data from files where id=?", (int(img[1:]),)); blob = r["data"] if r else None
+    elif img: fid = img
+    ok = bad = 0
+    for r0 in qa("select id from users where banned=0"):
+        uid = r0["id"]
+        try:
+            if blob and not fid:
+                r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto", data={"chat_id": uid, "caption": text, "parse_mode": "HTML"},
+                                  files={"photo": ("p.jpg", blob)}, timeout=40).json()
+                if r.get("ok"): fid = r["result"]["photo"][-1]["file_id"]
+            elif fid: r = tg("sendPhoto", chat_id=uid, photo=fid, caption=text, parse_mode="HTML")
+            else: r = tg("sendMessage", chat_id=uid, text=text, parse_mode="HTML")
+            if r.get("ok"): ok += 1
+            else: bad += 1
+        except Exception: bad += 1
+        time.sleep(0.05)
+    for a in all_admins(): notify(a, f"📨 Xabar yuborildi: ✅ {ok}  ❌ {bad}")
 
-    if act == "g":
-        gid = int(p[2])
-        g = q("SELECT * FROM games WHERE id=?", (gid,), one=True)
-        n = q("SELECT COUNT(*) c FROM packages WHERE game_id=?", (gid,), one=True)["c"]
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"📦 Paketlar ({n})", callback_data=f"a:pkgs:{gid}")],
-            [InlineKeyboardButton("✏️ Nomi", callback_data=f"a:gset:title:{gid}"),
-              InlineKeyboardButton("🖼 Rasm URL/emoji", callback_data=f"a:gset:image:{gid}")],
-            [InlineKeyboardButton("📷 Galereyadan rasm yuklash", callback_data=f"a:gimage:{gid}")],
-            [InlineKeyboardButton("💠 Birlik", callback_data=f"a:gset:unit:{gid}"),
-             InlineKeyboardButton("🆔 Hint", callback_data=f"a:gset:hint:{gid}")],
-            [InlineKeyboardButton("🔴 O'chirish" if g["active"] else "🟢 Yoqish",
-                                  callback_data=f"a:gtog:{gid}"),
-             InlineKeyboardButton("🗑 Butunlay o'chirish", callback_data=f"a:gdel:{gid}")],
-            [InlineKeyboardButton("⬅️ Orqaga", callback_data="a:games")]])
-        return await edit(qy, f"🎮 <b>{g['title']}</b>\n\nBirlik: {g['unit']}\n"
-                              f"Hint: {g['hint']}\nHolat: {'faol' if g['active'] else 'o‘chirilgan'}", kb)
+@web.route("/api/a/broadcast", methods=["POST"])
+@need_admin
+def a_broadcast(u):
+    d = request.get_json(silent=True) or {}
+    threading.Thread(target=do_broadcast, args=(str(d.get("text", "")), str(d.get("img", ""))), daemon=True).start()
+    return jsonify(ok=True)
 
-    if act == "gtog":
-        gid = int(p[2])
-        x("UPDATE games SET active=1-active WHERE id=?", (gid,))
-        qy.data = f"a:g:{gid}"
-        return await cb_admin(update, ctx)
-
-    if act == "gdel":
-        gid = int(p[2])
-        x("DELETE FROM packages WHERE game_id=?", (gid,))
-        x("DELETE FROM games WHERE id=?", (gid,))
-        qy.data = "a:games"
-        return await cb_admin(update, ctx)
-
-    if act == "gimage":
-        gid = int(p[2])
-        g = q("SELECT title FROM games WHERE id=?", (gid,), one=True)
-        if not g:
-            return await edit(qy, "❌ O'yin topilmadi.", InlineKeyboardMarkup([[back]]))
-        ctx.user_data["aw"] = ("gimage", gid)
-        return await edit(qy,
-            f"📷 <b>{g['title']}</b> uchun galereyadan rasm yuboring.\n\n"
-            "Telegramda 📎 tugmasini bosing → Galereya → rasmni tanlang.\n"
-            "Rasm yuborilgach, u shu o'yinga saqlanadi va Mini App'da ko'rinadi.\n\n"
-            "Tavsiya: kvadrat (1:1), tiniq PNG/JPG.\n"
-            "Bekor qilish uchun Orqaga tugmasini bosing.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:g:{gid}")]]))
-
-    if act == "gset":
-        ctx.user_data["aw"] = ("gset", p[2], int(p[3]))
-        return await edit(qy, f"Yangi qiymatni yuboring (<code>{p[2]}</code>):",
-                          InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data=f"a:g:{p[3]}")]]))
-
-    if act == "pkgs":
-        gid = int(p[2])
-        rows = q("SELECT * FROM packages WHERE game_id=? ORDER BY sort,id", (gid,))
-        kb = [[InlineKeyboardButton(
-            f"{'🟢' if r['active'] else '🔴'} {r['title']} — {fmt(r['price'])}",
-            callback_data=f"a:p:{r['id']}")] for r in rows]
-        kb.append([InlineKeyboardButton("➕ Paket qo'shish", callback_data=f"a:padd:{gid}")])
-        kb.append([InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:g:{gid}")])
-        return await edit(qy, "📦 <b>Paketlar</b>", InlineKeyboardMarkup(kb))
-
-    if act == "padd":
-        ctx.user_data["aw"] = ("padd", int(p[2]))
-        return await edit(qy, "Paketni yuboring:\n\n<code>Nomi | narx | eski_narx</code>\n\n"
-                              "Masalan: <code>100 + 10 Diamonds | 9990 | 12000</code>",
-                          InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data=f"a:pkgs:{p[2]}")]]))
-
-    if act == "p":
-        pid = int(p[2])
-        r = q("SELECT * FROM packages WHERE id=?", (pid,), one=True)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💵 Narx", callback_data=f"a:pset:price:{pid}"),
-             InlineKeyboardButton("🏷 Eski narx", callback_data=f"a:pset:old_price:{pid}")],
-            [InlineKeyboardButton("✏️ Nomi", callback_data=f"a:pset:title:{pid}"),
-             InlineKeyboardButton("🔴/🟢 Holat", callback_data=f"a:ptog:{pid}")],
-            [InlineKeyboardButton("🗑 O'chirish", callback_data=f"a:pdel:{pid}")],
-            [InlineKeyboardButton("⬅️ Orqaga", callback_data=f"a:pkgs:{r['game_id']}")]])
-        return await edit(qy, f"📦 <b>{r['title']}</b>\n\n💵 Narx: <b>{fmt(r['price'])}</b> so'm\n"
-                              f"🏷 Eski: {fmt(r['old_price'])} so'm\n"
-                              f"Holat: {'faol' if r['active'] else 'o‘chirilgan'}", kb)
-
-    if act == "pset":
-        ctx.user_data["aw"] = ("pset", p[2], int(p[3]))
-        return await edit(qy, f"Yangi qiymat (<code>{p[2]}</code>):",
-                          InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data=f"a:p:{p[3]}")]]))
-
-    if act == "ptog":
-        x("UPDATE packages SET active=1-active WHERE id=?", (int(p[2]),))
-        qy.data = f"a:p:{p[2]}"
-        return await cb_admin(update, ctx)
-
-    if act == "pdel":
-        r = q("SELECT game_id FROM packages WHERE id=?", (int(p[2]),), one=True)
-        x("DELETE FROM packages WHERE id=?", (int(p[2]),))
-        qy.data = f"a:pkgs:{r['game_id']}"
-        return await cb_admin(update, ctx)
-
-    # ---------------- Karta ----------------
-    if act == "card":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 UZCARD raqam", callback_data="a:set:card_number"),
-             InlineKeyboardButton("👤 Egasi", callback_data="a:set:card_holder")],
-            [InlineKeyboardButton("💳 HUMO raqam", callback_data="a:set:card2_number"),
-             InlineKeyboardButton("👤 Egasi", callback_data="a:set:card2_holder")],
-            [back]])
-        return await edit(qy,
-            f"💳 <b>To'lov kartalari</b>\n\n"
-            f"UZCARD: <code>{S('card_number')}</code>\n{S('card_holder')}\n\n"
-            f"HUMO: <code>{S('card2_number')}</code>\n{S('card2_holder')}", kb)
-
-    # ---------------- Majburiy obuna ----------------
-    if act == "subs":
-        rows = q("SELECT * FROM channels")
-        kb = [[InlineKeyboardButton(f"🗑 {c['title']}", callback_data=f"a:subdel:{c['id']}")]
-              for c in rows]
-        kb.append([InlineKeyboardButton("➕ Kanal qo'shish", callback_data="a:subadd")])
-        kb.append([back])
-        txt = "📢 <b>Majburiy obuna</b>\n\n" + (
-            "\n".join(f"• {c['title']} — <code>{c['chat_id']}</code>" for c in rows)
-            or "Kanal qo'shilmagan.")
-        return await edit(qy, txt, InlineKeyboardMarkup(kb))
-
-    if act == "subadd":
-        ctx.user_data["aw"] = ("subadd",)
-        return await edit(qy, "Kanalni yuboring:\n\n<code>@kanal | Nomi | https://t.me/kanal</code>\n\n"
-                              "⚠️ Bot kanalda admin bo'lishi shart.",
-                          InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data="a:subs")]]))
-
-    if act == "subdel":
-        x("DELETE FROM channels WHERE id=?", (int(p[2]),))
-        qy.data = "a:subs"
-        return await cb_admin(update, ctx)
-
-    # ---------------- Balans ----------------
-    if act == "bal":
-        ctx.user_data["aw"] = ("bal",)
-        return await edit(qy, "Balans o'zgartirish:\n\n<code>user_id | summa</code>\n\n"
-                              "Qo'shish: <code>7849637859 | 50000</code>\n"
-                              "Ayirish: <code>7849637859 | -50000</code>",
-                          InlineKeyboardMarkup([[back]]))
-
-    # ---------------- Promokod ----------------
-    if act == "promo":
-        rows = q("SELECT * FROM promos")
-        kb = [[InlineKeyboardButton(f"🗑 {r['code']} ({fmt(r['amount'])}) {r['used']}/{r['max_uses']}",
-                                    callback_data=f"a:promodel:{r['code']}")] for r in rows]
-        kb.append([InlineKeyboardButton("➕ Promokod qo'shish", callback_data="a:promoadd")])
-        kb.append([back])
-        return await edit(qy, "🎟 <b>Promokodlar</b>", InlineKeyboardMarkup(kb))
-
-    if act == "promoadd":
-        ctx.user_data["aw"] = ("promoadd",)
-        return await edit(qy, "Promokod:\n\n<code>KOD | summa | nechta_marta</code>\n\n"
-                              "Masalan: <code>DANAT10 | 10000 | 100</code>",
-                          InlineKeyboardMarkup([[InlineKeyboardButton("⬅️", callback_data="a:promo")]]))
-
-    if act == "promodel":
-        x("DELETE FROM promos WHERE code=?", (p[2],))
-        qy.data = "a:promo"
-        return await cb_admin(update, ctx)
-
-    # ---------------- Buyurtma / to'ldirish ro'yxati ----------------
-    if act == "orders":
-        rows = q("SELECT * FROM orders WHERE status='pending' ORDER BY id DESC LIMIT 15")
-        if not rows:
-            return await edit(qy, "🧾 Kutilayotgan buyurtma yo'q.", InlineKeyboardMarkup([[back]]))
-        kb = [[InlineKeyboardButton(f"✅ #{r['id']}", callback_data=f"o:ok:{r['id']}"),
-               InlineKeyboardButton(f"❌ #{r['id']}", callback_data=f"o:no:{r['id']}")] for r in rows]
-        kb.append([back])
-        txt = "🧾 <b>Kutilayotgan buyurtmalar</b>\n\n" + "\n".join(
-            f"#{r['id']} — {r['title']} | <code>{r['player_id']}</code> | {fmt(r['amount'])}"
-            for r in rows)
-        return await edit(qy, txt, InlineKeyboardMarkup(kb))
-
-    if act == "tops":
-        rows = q("SELECT * FROM topups WHERE status='pending' ORDER BY id DESC LIMIT 15")
-        if not rows:
-            return await edit(qy, "💰 Kutilayotgan to'ldirish yo'q.", InlineKeyboardMarkup([[back]]))
-        kb = [[InlineKeyboardButton(f"✅ #{r['id']}", callback_data=f"t:ok:{r['id']}"),
-               InlineKeyboardButton(f"❌ #{r['id']}", callback_data=f"t:no:{r['id']}")] for r in rows]
-        kb.append([back])
-        txt = "💰 <b>Kutilayotgan to'ldirishlar</b>\n\n" + "\n".join(
-            f"#{r['id']} — <code>{r['user_id']}</code> | {fmt(r['amount'])} so'm" for r in rows)
-        return await edit(qy, txt, InlineKeyboardMarkup(kb))
-
-    # ---------------- Foydalanuvchilar ----------------
-    if act == "users":
-        ctx.user_data["aw"] = ("finduser",)
-        n = q("SELECT COUNT(*) c FROM users", one=True)["c"]
-        return await edit(qy, f"👥 Jami: <b>{n}</b>\n\nQidirish uchun user_id yoki @username yuboring.",
-                          InlineKeyboardMarkup([[back]]))
-
-    if act == "ban":
-        x("UPDATE users SET banned=1-banned WHERE id=?", (int(p[2]),))
-        u2 = get_user(int(p[2]))
-        return await edit(qy, f"👤 {u2['name']} — {'🚫 bloklandi' if u2['banned'] else '✅ blokdan chiqarildi'}",
-                          InlineKeyboardMarkup([[back]]))
-
-    # ---------------- Reklama ----------------
-    if act == "bcast":
-        ctx.user_data["aw"] = ("bcast",)
-        return await edit(qy, "📣 Reklama matnini yuboring (yoki rasm + izoh).",
-                          InlineKeyboardMarkup([[back]]))
-
-    # ---------------- Sozlamalar ----------------
-    if act == "settings":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🏪 Do'kon nomi", callback_data="a:set:shop_name")],
-            [InlineKeyboardButton("💵 Min. to'ldirish", callback_data="a:set:min_topup"),
-             InlineKeyboardButton("🎁 Referal bonus", callback_data="a:set:ref_bonus")],
-            [InlineKeyboardButton("🎧 Support username", callback_data="a:set:support")],
-            [InlineKeyboardButton("📰 Banner matni", callback_data="a:set:banner")],
-            [back]])
-        return await edit(qy,
-            f"⚙️ <b>Sozlamalar</b>\n\n🏪 {S('shop_name')}\n"
-            f"💵 Min: {fmt(S('min_topup','1000'))} so'm\n"
-            f"🎁 Referal: {fmt(S('ref_bonus','500'))} so'm\n"
-            f"🎧 @{S('support')}\n📰 {S('banner')}", kb)
-
-    if act == "set":
-        ctx.user_data["aw"] = ("set", p[2])
-        return await edit(qy, f"Yangi qiymat (<code>{p[2]}</code>):",
-                          InlineKeyboardMarkup([[back]]))
-
-
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    aw = ctx.user_data.get("aw")
-    if not aw or not is_admin(uid):
-        return
-    t = (update.message.text or update.message.caption or "").strip()
-    kind = aw[0]
-    ok = lambda m: update.message.reply_text(m, parse_mode="HTML", reply_markup=adm_home_kb())
-
+# ============================ ZAXIRA (Render bepul rejasi bazani o'chirmasligi uchun) ============================
+_last_bak = {"id": None}
+def backup_now():
+    if not OWNERS: return
     try:
-        if kind == "set":
-            setS(aw[1], t)
-            ctx.user_data.pop("aw")
-            return await ok(f"✅ <code>{aw[1]}</code> yangilandi.")
-
-        if kind == "gset":
-            x(f"UPDATE games SET {aw[1]}=? WHERE id=?", (t, aw[2]))
-            ctx.user_data.pop("aw")
-            return await ok("✅ O'yin yangilandi.")
-
-        if kind == "pset":
-            v = int(t) if aw[1] in ("price", "old_price") else t
-            x(f"UPDATE packages SET {aw[1]}=? WHERE id=?", (v, aw[2]))
-            ctx.user_data.pop("aw")
-            return await ok("✅ Paket yangilandi.")
-
-        if kind == "gadd":
-            a = [s.strip() for s in t.split("|")]
-            x("INSERT INTO games(title,image,unit,hint,active,sort) VALUES(?,?,?,?,1,99)",
-              (a[0], a[1], a[2] if len(a) > 2 else "Olmoslar",
-               a[3] if len(a) > 3 else "O'yin ID"))
-            ctx.user_data.pop("aw")
-            return await ok("✅ O'yin qo'shildi.")
-
-        if kind == "padd":
-            a = [s.strip() for s in t.split("|")]
-            x("INSERT INTO packages(game_id,title,price,old_price,active,sort) VALUES(?,?,?,?,1,99)",
-              (aw[1], a[0], int(a[1]), int(a[2]) if len(a) > 2 else 0))
-            ctx.user_data.pop("aw")
-            return await ok("✅ Paket qo'shildi.")
-
-        if kind == "subadd":
-            a = [s.strip() for s in t.split("|")]
-            x("INSERT INTO channels(chat_id,title,url) VALUES(?,?,?)",
-              (a[0], a[1] if len(a) > 1 else a[0],
-               a[2] if len(a) > 2 else "https://t.me/" + a[0].lstrip("@")))
-            ctx.user_data.pop("aw")
-            return await ok("✅ Kanal qo'shildi.")
-
-        if kind == "promoadd":
-            a = [s.strip() for s in t.split("|")]
-            x("INSERT OR REPLACE INTO promos(code,amount,max_uses,used,active) VALUES(?,?,?,0,1)",
-              (a[0].upper(), int(a[1]), int(a[2]) if len(a) > 2 else 1))
-            ctx.user_data.pop("aw")
-            return await ok("✅ Promokod qo'shildi.")
-
-        if kind == "bal":
-            a = [s.strip() for s in t.split("|")]
-            tid, amt = int(a[0]), int(a[1])
-            if not get_user(tid):
-                return await update.message.reply_text("❌ Foydalanuvchi topilmadi.")
-            balance_add(tid, amt, "Admin")
-            nb = get_user(tid)["balance"]
-            await ctx.bot.send_message(tid,
-                f"{'➕' if amt > 0 else '➖'} Balansingiz o'zgardi: {fmt(amt)} so'm\n"
-                f"💼 Yangi balans: {fmt(nb)} so'm")
-            ctx.user_data.pop("aw")
-            return await ok(f"✅ Bajarildi. Yangi balans: <b>{fmt(nb)}</b> so'm")
-
-        if kind == "finduser":
-            if t.startswith("@"):
-                u2 = q("SELECT * FROM users WHERE username=?", (t[1:],), one=True)
-            else:
-                u2 = get_user(int(t))
-            if not u2:
-                return await update.message.reply_text("❌ Topilmadi.")
-            ctx.user_data.pop("aw")
-            return await update.message.reply_text(
-                f"👤 <b>{u2['name']}</b>\nID: <code>{u2['id']}</code>\n"
-                f"@{u2['username'] or '-'}\n💼 Balans: <b>{fmt(u2['balance'])}</b> so'm\n"
-                f"👥 Referal: {u2['refs']}\nHolat: {'🚫 bloklangan' if u2['banned'] else '✅ faol'}",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚫 Ban / Unban", callback_data=f"a:ban:{u2['id']}")],
-                    [InlineKeyboardButton("⬅️ Admin panel", callback_data="a:home")]]))
-
-        if kind == "bcast":
-            ctx.user_data.pop("aw")
-            ids = [r["id"] for r in q("SELECT id FROM users WHERE banned=0")]
-            await update.message.reply_text(f"📣 Yuborilmoqda... ({len(ids)})")
-            sent = 0
-            photo = update.message.photo[-1].file_id if update.message.photo else None
-            for i in ids:
-                try:
-                    if photo:
-                        await ctx.bot.send_photo(i, photo, caption=t, parse_mode="HTML")
-                    else:
-                        await ctx.bot.send_message(i, t, parse_mode="HTML")
-                    sent += 1
-                except Exception:
-                    pass
-                if sent % 25 == 0:
-                    time.sleep(1)
-            return await ok(f"✅ Yuborildi: <b>{sent}</b> / {len(ids)}")
-
+        tmp = "/tmp/syrexa_backup.db"
+        if os.path.exists(tmp): os.remove(tmp)
+        dst = sqlite3.connect(tmp)
+        with _lock: db.backup(dst)
+        dst.close()
+        with open(tmp, "rb") as f:
+            r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument", data={"chat_id": OWNERS[0], "caption": "💾 Syrexa zaxira nusxa " + ts(time.time())},
+                              files={"document": ("syrexa_backup.db", f)}, timeout=120).json()
+        if r.get("ok"):
+            mid = r["result"]["message_id"]
+            tg("pinChatMessage", chat_id=OWNERS[0], message_id=mid, disable_notification=True)
+            if _last_bak["id"]: tg("deleteMessage", chat_id=OWNERS[0], message_id=_last_bak["id"])
+            _last_bak["id"] = mid
     except Exception as e:
-        return await update.message.reply_text(f"❌ Xato: {e}\nFormatni tekshiring.")
+        log.warning("backup: %s", e)
 
+def restore_from(path):
+    src = sqlite3.connect(path); src.execute("select count(*) from games")
+    with _lock: src.backup(db)
+    src.close(); init_db()
 
-# ----------------------------------------------------------------------------
-# MINI APP (HTML)
-# ----------------------------------------------------------------------------
-HTML = r"""<!doctype html>
-<html lang="uz"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>DANAT SHOP</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-:root{
-  --bg:#f2f5f9; --card:#fff; --ink:#0d1b2a; --mut:#6b7a90; --line:#e3e9f1;
-  --brand:#1b6ef3; --brand2:#0b4fc4; --ok:#12a150; --warn:#e4a11b; --bad:#e5484d;
-  --r:18px; --sh:0 6px 20px rgba(13,27,42,.07);
-}
-body.dark{--bg:#0e1116;--card:#161b23;--ink:#e8edf4;--mut:#8b98ab;--line:#232a35;--sh:none}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding-bottom:96px}
-.wrap{max-width:560px;margin:0 auto;padding:14px}
-.top{display:flex;align-items:center;gap:10px;padding:12px 14px;position:sticky;top:0;z-index:20;background:var(--bg)}
-.av{width:46px;height:46px;border-radius:50%;object-fit:cover;background:var(--line)}
-.hi{font-size:12px;color:var(--mut)}
-.nm{font-weight:800;font-size:17px;text-transform:uppercase}
-.chip{margin-left:auto;display:flex;gap:6px}
-.chip button{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-size:13px;color:var(--ink);font-weight:600;cursor:pointer}
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh)}
-.bal{display:flex;align-items:center;gap:12px;padding:16px}
-.bal .ico{width:44px;height:44px;border-radius:14px;background:var(--bg);display:grid;place-items:center;font-size:20px}
-.bal b{font-size:24px;display:block;color:var(--brand)}
-.bal small{color:var(--mut);font-size:11px;letter-spacing:.06em}
-.btn{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border:0;border-radius:999px;padding:12px 18px;font-weight:700;font-size:15px;cursor:pointer}
-.btn.wide{width:100%;border-radius:16px;padding:16px}
-.btn.gray{background:var(--bg);color:var(--ink);border:1px solid var(--line)}
-.btn.green{background:var(--ok)}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
-.row2 .card{padding:14px;text-align:center;font-weight:700;font-size:14px;cursor:pointer}
-.banner{margin-top:12px;border-radius:var(--r);overflow:hidden;background:linear-gradient(120deg,#2b1055,#7b2ff7);color:#fff;padding:22px 18px}
-.banner h3{margin:0 0 6px;font-size:22px;line-height:1.1;font-weight:900}
-.banner p{margin:0;opacity:.8;font-size:13px}
-.sec{display:flex;align-items:center;margin:20px 0 10px}
-.sec h4{margin:0;font-size:18px;font-weight:800}
-.sec a{margin-left:auto;color:var(--brand);font-size:14px;font-weight:600;cursor:pointer}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-@media(max-width:400px){.grid{grid-template-columns:repeat(3,1fr)}}
-.g{cursor:pointer}
-.g img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:16px;background:var(--line)}
-.g span{display:block;font-size:11px;margin-top:6px;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--mut)}
-.pk{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.pkg{padding:12px;position:relative;cursor:pointer;border-radius:16px}
-.pkg.sel{border-color:var(--brand);box-shadow:0 0 0 2px var(--brand) inset}
-.pkg .ph{height:74px;border-radius:12px;background:var(--bg);display:grid;place-items:center;font-size:28px;margin-bottom:8px}
-.pkg .t{font-size:13px;font-weight:700}
-.pkg .p{color:var(--ok);font-weight:800;font-size:15px;margin-top:2px}
-.pkg .o{color:var(--mut);font-size:11px;text-decoration:line-through}
-.badge{position:absolute;top:8px;right:8px;background:var(--brand);color:#fff;font-size:11px;font-weight:700;padding:3px 8px;border-radius:999px}
-.inp{width:100%;padding:14px;border-radius:14px;border:1px solid var(--line);background:var(--card);color:var(--ink);font-size:15px;outline:none}
-.inp:focus{border-color:var(--brand)}
-.hero{position:relative;height:190px;border-radius:var(--r);overflow:hidden;margin-bottom:12px}
-.hero img{width:100%;height:100%;object-fit:cover;filter:saturate(1.1)}
-.hero h2{position:absolute;left:16px;bottom:14px;margin:0;color:#fff;font-size:26px;font-weight:900;text-shadow:0 2px 12px rgba(0,0,0,.6)}
-.back{position:absolute;left:12px;top:12px;width:36px;height:36px;border-radius:50%;background:rgba(0,0,0,.45);color:#fff;border:0;font-size:18px;cursor:pointer}
-.steps{padding:16px}
-.steps div{display:flex;gap:10px;align-items:flex-start;margin-bottom:10px;font-size:14px;color:var(--brand2)}
-.steps i{width:24px;height:24px;border-radius:50%;background:var(--bg);color:var(--mut);display:grid;place-items:center;font-style:normal;font-size:12px;flex:0 0 auto}
-.pay{padding:18px;text-align:center}
-.pay .amt{font-size:32px;font-weight:900;color:var(--brand)}
-.pay .card-no{font-size:22px;font-weight:800;letter-spacing:.06em;margin:6px 0}
-.list .it{padding:14px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--line)}
-.list .it:last-child{border:0}
-.st{font-size:11px;padding:3px 9px;border-radius:999px;font-weight:700;margin-left:auto;white-space:nowrap}
-.st.pending{background:#fff4d6;color:#8a6100}
-.st.done{background:#dcf5e7;color:#0b6b36}
-.st.rejected{background:#fde0e0;color:#a11318}
-.empty{text-align:center;padding:60px 20px;color:var(--mut)}
-.empty div{font-size:44px;margin-bottom:10px}
-nav{position:fixed;left:0;right:0;bottom:0;display:flex;justify-content:space-around;background:var(--card);border-top:1px solid var(--line);padding:8px 6px 14px;z-index:30}
-nav button{background:0;border:0;color:var(--mut);font-size:11px;display:grid;justify-items:center;gap:3px;cursor:pointer;padding:6px 10px;border-radius:14px}
-nav button span{font-size:19px}
-nav button.on{color:#fff;background:var(--brand)}
-.mask{position:fixed;inset:0;background:rgba(6,10,16,.75);display:grid;place-items:center;z-index:99;padding:20px}
-.mask .card{padding:22px;max-width:380px;width:100%}
-.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:110px;background:#0d1b2a;color:#fff;padding:12px 18px;border-radius:14px;z-index:200;font-size:14px;opacity:0;transition:.25s}
-.toast.on{opacity:1}
-.menu{position:absolute;right:14px;top:60px;background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;z-index:50}
-.menu button{display:block;width:100%;text-align:left;padding:12px 20px;border:0;background:0;color:var(--ink);font-size:15px;cursor:pointer}
-</style></head><body>
+def auto_restore():
+    if not OWNERS: return
+    if q1("select count(*) c from users")["c"] or q1("select count(*) c from products")["c"]: return
+    pm = tg("getChat", chat_id=OWNERS[0]).get("result", {}).get("pinned_message") or {}
+    fid = (pm.get("document") or {}).get("file_id")
+    if not fid: return
+    fp = tg("getFile", file_id=fid).get("result", {}).get("file_path")
+    if not fp: return
+    open("/tmp/restore.db", "wb").write(requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", timeout=120).content)
+    restore_from("/tmp/restore.db"); _last_bak["id"] = pm.get("message_id")
+    log.info("Baza zaxiradan tiklandi")
 
-<div class="top">
-  <img id="av" class="av" src="">
-  <div><div class="hi">Salom 👋</div><div class="nm" id="uname">—</div></div>
-  <div class="chip">
-    <button id="langBtn">🌐 UZ</button>
-    <button>UZS</button>
-    <button id="thBtn">🌙</button>
-  </div>
-</div>
-<div id="langMenu" class="menu" style="display:none">
-  <button data-l="uz">🇺🇿 O'zbekcha</button>
-  <button data-l="ru">🇷🇺 Русский</button>
-  <button data-l="en">🇬🇧 English</button>
-  <button data-l="kk">🇰🇿 Қазақша</button>
-  <button data-l="ky">🇰🇬 Кыргызча</button>
-</div>
+def backup_loop():
+    last = db.total_changes; lastt = 0
+    while True:
+        time.sleep(120)
+        if db.total_changes != last and time.time() - lastt > 240:
+            last = db.total_changes; lastt = time.time(); backup_now()
 
-<div class="wrap" id="view"></div>
+async def cmd_backup(update, ctx):
+    if is_admin(update.effective_user.id):
+        await update.message.reply_text("⏳ Zaxira nusxa yuborilmoqda...")
+        await asyncio.to_thread(backup_now)
 
-<nav>
-  <button data-t="home" class="on"><span>🏠</span>Asosiy</button>
-  <button data-t="games"><span>🎮</span>O'yinlar</button>
-  <button data-t="topup"><span>💳</span>To'ldirish</button>
-  <button data-t="orders"><span>🕘</span>Buyurtmalar</button>
-  <button data-t="profile"><span>👤</span>Profil</button>
-</nav>
-<div class="toast" id="toast"></div>
+async def on_doc(update, ctx):
+    u = update.effective_user; m = update.message
+    if not u or not is_admin(u.id) or not m.document or "/restore" not in (m.caption or ""): return
+    f = await m.document.get_file(); await f.download_to_drive("/tmp/restore.db")
+    try:
+        restore_from("/tmp/restore.db"); await m.reply_text("✅ Baza tiklandi")
+    except Exception as e:
+        await m.reply_text(f"❌ Xato: {e}")
 
-<script>
-const TG = window.Telegram.WebApp; TG.expand(); TG.ready();
-const INIT = TG.initData || "";
-let ST = {user:null, shop:null, games:[], tab:"home", game:null, pkg:null, lang:"uz",
-          orders:[], topups:[], pay:null};
-const V = document.getElementById('view');
+# ============================ BOT: USER SIDE ============================
+def webapp_url():
+    return BASE_URL + "/"
 
-const T = {
- uz:{bal:"BALANS",topup:"To'ldirish",promo:"Promokodlar",help:"Yordam",pop:"Ommabop o'yinlar",
-     all:"Barchasi",allg:"Barcha o'yinlar",search:"O'yin yoki xizmat qidirish",choose:"Paketni tanlang",
-     buy:"Sotib olish",idph:"O'yin ID raqamingiz",srv:"Server ID",bt:"Balansni to'ldirish",
-     pm:"To'lov usuli",min:"Eng kam",cont:"Davom etish",wait:"To'lov kutilmoqda",
-     copy:"Nusxa olish",orders:"Buyurtmalar",tx:"Tranzaksiyalar",noord:"Buyurtmalar yo'q",
-     noord2:"Birinchi buyurtmangiz shu yerda ko'rinadi",out:"Chiqish",ref:"Do'st taklif qiling — bonus oling",
-     share:"Ulashish",invited:"TAKLIF QILINGAN",top:"Top donaterlar",sum:"Summani kiriting",
-     steps:["To'lov usuli va summani tanlang","Ko'rsatilgan raqamga AYNAN shu summani o'tkazing",
-            "Skrinshotni botga yuboring","Admin tekshirgach balansingiz yangilanadi"]},
- ru:{bal:"БАЛАНС",topup:"Пополнить",promo:"Промокоды",help:"Помощь",pop:"Популярные игры",
-     all:"Все",allg:"Все игры",search:"Поиск игры или услуги",choose:"Выберите пакет",
-     buy:"Купить",idph:"Ваш игровой ID",srv:"ID сервера",bt:"Пополнение баланса",
-     pm:"Способ оплаты",min:"Минимум",cont:"Продолжить",wait:"Ожидание оплаты",
-     copy:"Копировать",orders:"Заказы",tx:"Транзакции",noord:"Заказов нет",
-     noord2:"Ваш первый заказ появится здесь",out:"Выйти",ref:"Пригласи друга — получи бонус",
-     share:"Поделиться",invited:"ПРИГЛАШЕНО",top:"Топ донатеры",sum:"Введите сумму",
-     steps:["Выберите способ и сумму","Переведите ТОЧНО эту сумму","Отправьте скриншот боту",
-            "После проверки баланс обновится"]},
- en:{bal:"BALANCE",topup:"Top up",promo:"Promo codes",help:"Support",pop:"Popular games",
-     all:"All",allg:"All games",search:"Search a game or service",choose:"Choose a package",
-     buy:"Buy",idph:"Your game ID",srv:"Server ID",bt:"Top up balance",
-     pm:"Payment method",min:"Minimum",cont:"Continue",wait:"Waiting for payment",
-     copy:"Copy",orders:"Orders",tx:"Transactions",noord:"No orders yet",
-     noord2:"Your first order will appear here",out:"Log out",ref:"Invite a friend — get a bonus",
-     share:"Share",invited:"INVITED",top:"Top donators",sum:"Enter amount",
-     steps:["Pick a method and amount","Transfer the EXACT amount","Send the receipt to the bot",
-            "Balance updates after review"]}
-};
-T.kk = T.ru; T.ky = T.ru;
-const t = k => (T[ST.lang]||T.uz)[k];
-const money = n => (n||0).toLocaleString('ru-RU').replace(/,/g,' ');
+async def send_welcome(update: Update, ctx):
+    u = update.effective_user
+    row = upsert_user(u.id, (u.first_name or "") + " " + (u.last_name or ""), u.username)
+    if row["banned"]: return
+    if gs("maintenance") == "1" and not is_admin(u.id):
+        return await ctx.bot.send_message(u.id, "🛠 Texnik ishlar olib borilmoqda. Keyinroq urinib ko'ring.")
+    subs = not_subbed(u.id)
+    if subs:
+        rows = [[InlineKeyboardButton(f"📢 {c['title'] or 'Kanal'}", url=c["link"])] for c in subs if link_ok(c["link"])]
+        rows.append([InlineKeyboardButton("✅ Tekshirish", callback_data="chk")])
+        return await ctx.bot.send_message(u.id, "Botdan foydalanish uchun kanallarga obuna bo'ling:",
+                                          reply_markup=InlineKeyboardMarkup(rows))
+    text = gs("welcome_ru" if row["lang"] == "ru" else "welcome_uz").replace("{name}", E(u.first_name or ""))
+    rows = [[InlineKeyboardButton("📱 Ilovani ochish", web_app=WebAppInfo(url=webapp_url()))]]
+    r2 = []
+    if link_ok(gs("channel_link")): r2.append(InlineKeyboardButton("Bizning kanal", url=gs("channel_link")))
+    if link_ok(gs("support_link")): r2.append(InlineKeyboardButton("Yordam", url=gs("support_link")))
+    if r2: rows.append(r2)
+    kb = InlineKeyboardMarkup(rows)
+    img = gs("welcome_img")
+    if re.fullmatch(r"f\d+", img or ""):
+        _r = q1("select data from files where id=?", (int(img[1:]),)); img = _r["data"] if _r else None
+    if img:
+        try:
+            return await ctx.bot.send_photo(u.id, img, caption=text, reply_markup=kb, parse_mode="HTML")
+        except Exception: pass
+    await ctx.bot.send_message(u.id, text, reply_markup=kb, parse_mode="HTML")
 
-function toast(m){const e=document.getElementById('toast');e.textContent=m;e.classList.add('on');
-  setTimeout(()=>e.classList.remove('on'),2200);}
-async function api(p,b={}){
-  const r = await fetch('/api/'+p,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(Object.assign({initData:INIT},b))});
-  return r.json();
-}
-function copy(s){navigator.clipboard.writeText(s); toast('Nusxalandi ✅');}
+async def cmd_start(update, ctx):
+    ctx.user_data.pop("st", None)
+    await send_welcome(update, ctx)
 
-async function boot(){
-  const d = await api('init');
-  if(!d.ok){V.innerHTML='<div class="empty"><div>🔒</div>Iltimos, botni Telegram orqali oching.</div>';return;}
-  ST.user=d.user; ST.shop=d.shop; ST.games=d.games; ST.lang=d.user.lang||'uz';
-  document.getElementById('uname').textContent=d.user.name;
-  const pu = TG.initDataUnsafe?.user?.photo_url;
-  if(pu) document.getElementById('av').src = pu;
-  else document.getElementById('av').outerHTML =
-    `<div id="av" class="av" style="display:grid;place-items:center;font-size:20px;background:linear-gradient(135deg,${grad(ST.user.name||'U')})">${(ST.user.name||'U')[0].toUpperCase()}</div>`;
-  document.getElementById('langBtn').textContent='🌐 '+ST.lang.toUpperCase();
-  if(d.subs && d.subs.length) return subsWall(d.subs);
-  render();
-}
-function subsWall(list){
-  document.body.insertAdjacentHTML('beforeend',
-   `<div class="mask"><div class="card" style="padding:22px">
-     <h3 style="margin:0 0 6px">📢 Obuna bo'ling</h3>
-     <p style="color:var(--mut);font-size:14px;margin:0 0 14px">Davom etish uchun kanallarga a'zo bo'ling.</p>
-     ${list.map(c=>`<a href="${c.url}" target="_blank" class="btn wide" style="display:block;text-align:center;text-decoration:none;margin-bottom:8px">${c.title}</a>`).join('')}
-     <button class="btn wide green" onclick="location.reload()">✅ Tekshirish</button>
-   </div></div>`);
-}
+async def cb_chk(update, ctx):
+    q = update.callback_query
+    _subcache.clear()
+    if not_subbed(q.from_user.id):
+        return await q.answer("❌ Hali obuna bo'lmagansiz", show_alert=True)
+    await q.answer("✅")
+    try: await q.message.delete()
+    except Exception: pass
+    await send_welcome(update, ctx)
 
-/* ---------- pages ---------- */
-function render(){
-  const p = {home:home, games:games, game:gamePage, topup:topup, pay:payPage,
-             orders:orders, profile:profile}[ST.tab] || home;
-  V.innerHTML = p();
-  document.querySelectorAll('nav button').forEach(b=>
-    b.classList.toggle('on', b.dataset.t===ST.tab || (ST.tab==='game'&&b.dataset.t==='games')
-      || (ST.tab==='pay'&&b.dataset.t==='topup')));
-  window.scrollTo(0,0);
-}
-const GRADS = ['#ff5e62,#ff9966','#00c6ff,#0072ff','#f7971e,#ffd200','#8e2de2,#4a00e0',
-               '#11998e,#38ef7d','#ee0979,#ff6a00','#396afc,#2948ff','#fc4a1a,#f7b733'];
-function grad(seed){let h=0;for(let i=0;i<seed.length;i++)h=(h*31+seed.charCodeAt(i))>>>0;
-  return GRADS[h%GRADS.length];}
+# ============================ BOT: ADMIN ============================
+def AK(rows):
+    out = []
+    for r in rows:
+        out.append([InlineKeyboardButton(t, url=d) if d.startswith("http") else InlineKeyboardButton(t, callback_data=d) for t, d in r])
+    return InlineKeyboardMarkup(out)
 
-/* Har bir o'yin turi uchun original (tashqi serverga bog'liq bo'lmagan) SVG belgi */
-const ART = [
- {m:/free ?fire/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
-   <defs><linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
-     <stop offset="0" stop-color="#ff5e3a"/><stop offset="1" stop-color="#ff2d55"/></linearGradient></defs>
-   <rect width="100" height="100" rx="20" fill="url(#g1)"/>
-   <path d="M50 16c-4 11-16 15-16 30a16 16 0 0032 0c0-9-6-11-7-18 2 3 5 7 5 11a9 9 0 01-18 0c0-10 7-15 4-23z" fill="#fff"/>
-   <path d="M50 16c-4 11-16 15-16 30a16 16 0 0032 0c0-9-6-11-7-18 2 3 5 7 5 11a9 9 0 01-18 0c0-10 7-15 4-23z" fill="#ffd200" opacity=".55" transform="translate(0,4) scale(.72)" style="transform-origin:50px 62px"/>
-   <circle cx="76" cy="22" r="6" fill="#fff" opacity=".9"/></svg>`},
- {m:/pubg/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
-   <defs><linearGradient id="g2" x1="0" y1="0" x2="1" y2="1">
-     <stop offset="0" stop-color="#4b6043"/><stop offset="1" stop-color="#1f2921"/></linearGradient></defs>
-   <rect width="100" height="100" rx="20" fill="url(#g2)"/>
-   <circle cx="50" cy="50" r="27" fill="none" stroke="#ffd452" stroke-width="4"/>
-   <circle cx="50" cy="50" r="14" fill="none" stroke="#ffd452" stroke-width="2.5" opacity=".7"/>
-   <line x1="50" y1="10" x2="50" y2="26" stroke="#ffd452" stroke-width="4"/>
-   <line x1="50" y1="74" x2="50" y2="90" stroke="#ffd452" stroke-width="4"/>
-   <line x1="10" y1="50" x2="26" y2="50" stroke="#ffd452" stroke-width="4"/>
-   <line x1="74" y1="50" x2="90" y2="50" stroke="#ffd452" stroke-width="4"/>
-   <circle cx="50" cy="50" r="5" fill="#ffd452"/></svg>`},
- {m:/standoff/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
-   <defs><linearGradient id="g3" x1="0" y1="0" x2="1" y2="1">
-     <stop offset="0" stop-color="#8e0e00"/><stop offset="1" stop-color="#1c1c1c"/></linearGradient></defs>
-   <rect width="100" height="100" rx="20" fill="url(#g3)"/>
-   <circle cx="50" cy="50" r="23" fill="none" stroke="#fff" stroke-width="3" opacity=".92"/>
-   <line x1="50" y1="9" x2="50" y2="28" stroke="#fff" stroke-width="3"/>
-   <line x1="50" y1="72" x2="50" y2="91" stroke="#fff" stroke-width="3"/>
-   <line x1="9" y1="50" x2="28" y2="50" stroke="#fff" stroke-width="3"/>
-   <line x1="72" y1="50" x2="91" y2="50" stroke="#fff" stroke-width="3"/>
-   <circle cx="50" cy="50" r="4.5" fill="#ff3b3b"/></svg>`},
- {m:/premium/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
-   <defs><linearGradient id="g4" x1="0" y1="0" x2="1" y2="1">
-     <stop offset="0" stop-color="#7f53ac"/><stop offset="1" stop-color="#2575fc"/></linearGradient></defs>
-   <rect width="100" height="100" rx="20" fill="url(#g4)"/>
-   <path d="M30 32h40l8 10-28 28-28-28z" fill="#fff" opacity=".95"/>
-   <path d="M30 32h40l8 10H22z" fill="#ffd23f"/>
-   <path d="M50 70l-13-28h26z" fill="#fff"/></svg>`},
- {m:/stars?/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
-   <defs><linearGradient id="g5" x1="0" y1="0" x2="1" y2="1">
-     <stop offset="0" stop-color="#2AABEE"/><stop offset="1" stop-color="#1c74bb"/></linearGradient></defs>
-   <rect width="100" height="100" rx="20" fill="url(#g5)"/>
-   <path d="M50 18l8 18 19 2-14 13 4 19-17-10-17 10 4-19-14-13 19-2z" fill="#ffd23f"/></svg>`},
- {m:/mobile ?legends|mlbb/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
-   <defs><linearGradient id="g6" x1="0" y1="0" x2="1" y2="1">
-     <stop offset="0" stop-color="#41295a"/><stop offset="1" stop-color="#2F0743"/></linearGradient></defs>
-   <rect width="100" height="100" rx="20" fill="url(#g6)"/>
-   <path d="M50 16l16 18-16 40-16-40z" fill="#7ee8fa"/>
-   <path d="M50 16l16 18h-32z" fill="#c8fbff" opacity=".8"/>
-   <line x1="50" y1="16" x2="50" y2="74" stroke="#fff" stroke-width="1.5" opacity=".5"/></svg>`},
- {m:/genshin/i, svg:`<svg viewBox="0 0 100 100" width="100%" height="100%">
-   <defs><linearGradient id="g7" x1="0" y1="0" x2="1" y2="1">
-     <stop offset="0" stop-color="#f7971e"/><stop offset="1" stop-color="#3a7bd5"/></linearGradient></defs>
-   <rect width="100" height="100" rx="20" fill="url(#g7)"/>
-   <circle cx="50" cy="50" r="24" fill="none" stroke="#fff" stroke-width="4"/>
-   <circle cx="50" cy="50" r="8" fill="#fff"/></svg>`},
-];
-function artFor(title, customEmoji){
-  const hit = ART.find(a=>a.m.test(title));
-  if(hit) return hit.svg;
-  const bg = grad(title);
-  return `<div style="width:100%;height:100%;display:grid;place-items:center;font-size:34px;
-    background:linear-gradient(135deg,${bg});border-radius:20px">${customEmoji||'🎮'}</div>`;
-}
-function thumb(g){
-  if(g.image && g.image.startsWith('tgfile:'))
-    return `<img src="/media/game/${g.id}" style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:20px" onerror="this.outerHTML=artFor('${g.title.replace(/'/g,"\\'")}')">`;
-  if(g.image && g.image.startsWith('http'))
-    return `<img src="${g.image}" style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:20px" onerror="this.outerHTML=artFor('${g.title.replace(/'/g,"\\'")}')">`;
-  const emo = (g.image && !g.image.startsWith('http')) ? g.image : null;
-  return `<div style="aspect-ratio:1">${artFor(g.title, emo)}</div>`;
-}
-function gcard(g){return `<div class="g" onclick="openGame(${g.id})">
-  ${thumb(g)}
-  <span>${g.title}</span></div>`;}
+BACK = [("🔙 Admin menyu", "a:home")]
 
-function home(){
-  return `
-  <div class="card bal">
-    <div class="ico">👛</div>
-    <div><small>${t('bal')}</small><b>${money(ST.user.balance)} <span style="font-size:14px;color:var(--mut)">so'm</span></b></div>
-    <button class="btn" style="margin-left:auto" onclick="go('topup')">+ ${t('topup')}</button>
-  </div>
-  <div class="row2">
-    <div class="card" onclick="go('profile')">🎟 ${t('promo')}</div>
-    <div class="card" onclick="TG.openTelegramLink('https://t.me/${ST.shop.support}')">🎧 ${t('help')}</div>
-  </div>
-  <div class="banner">
-    <h3>${ST.shop.name}</h3>
-    <p>${ST.shop.banner}</p>
-    <div style="display:flex;gap:14px;margin-top:14px;font-size:11px;opacity:.85;flex-wrap:wrap">
-      <span>⚡ Tezkor</span><span>🛡 100% xavfsiz</span><span>✨ Eng yaxshi narx</span><span>🕐 24/7</span></div>
-  </div>
-  <div class="sec"><h4>${t('pop')}</h4><a onclick="go('games')">${t('all')}</a></div>
-  <div class="grid">${ST.games.slice(0,8).map(gcard).join('')}</div>`;
-}
+async def show(update, view):
+    text, rows = view
+    q = update.callback_query
+    if q:
+        try:
+            return await q.edit_message_text(text, reply_markup=AK(rows), parse_mode="HTML", disable_web_page_preview=True)
+        except BadRequest as e:
+            if "not modified" in str(e).lower(): return
+            return await q.message.reply_text(text, reply_markup=AK(rows), parse_mode="HTML", disable_web_page_preview=True)
+    await update.message.reply_text(text, reply_markup=AK(rows), parse_mode="HTML", disable_web_page_preview=True)
 
-function games(){
-  return `<div class="sec"><h4>${t('allg')}</h4></div>
-  <input class="inp" id="sq" placeholder="🔍 ${t('search')}" oninput="filter()">
-  <div class="grid" id="ggrid" style="margin-top:14px">${ST.games.map(gcard).join('')}</div>`;
-}
-function filter(){
-  const v=document.getElementById('sq').value.toLowerCase();
-  document.getElementById('ggrid').innerHTML =
-    ST.games.filter(g=>g.title.toLowerCase().includes(v)).map(gcard).join('');
-}
+def v_home():
+    return ("🛠 <b>SYREXA — Admin panel</b>\nKerakli bo'limni tanlang:", [
+        [("📊 Statistika", "a:stat"), ("👥 Foydalanuvchilar", "a:users")],
+        [("🎮 O'yinlar / Narxlar", "a:games"), ("🖼 Bannerlar", "a:banners")],
+        [("💳 Kartalar", "a:cards"), ("💰 To'ldirishlar", "a:tops")],
+        [("📦 Buyurtmalar", "a:ords"), ("🎟 Promokodlar", "a:promos")],
+        [("📢 Majburiy obuna", "a:chs"), ("📨 Xabar yuborish", "a:bc")],
+        [("⚙️ Sozlamalar", "a:set"), ("👮 Adminlar", "a:adms")]])
 
-async function openGame(id){
-  const d = await api('game',{id});
-  if(!d.ok) return toast('Xato');
-  ST.game=d.game; ST.packages=d.packages; ST.pkg=null; ST.tab='game'; render();
-}
-function gamePage(){
-  const g=ST.game;
-  const heroBg = (g.image && g.image.startsWith('tgfile:'))
-    ? `<img src="/media/game/${g.id}" style="width:100%;height:100%;object-fit:cover" onerror="this.outerHTML=artFor('${g.title.replace(/'/g,"\\'")}')">`
-    : (g.image && g.image.startsWith('http'))
-      ? `<img src="${g.image}" style="width:100%;height:100%;object-fit:cover" onerror="this.outerHTML=artFor('${g.title.replace(/'/g,"\\'")}')">`
-      : artFor(g.title, (g.image && !g.image.startsWith('http')) ? g.image : null);
-  return `
-  <div class="hero"><button class="back" onclick="go('games')">‹</button>
-    ${heroBg}<h2>${g.title}</h2></div>
-  <div class="sec"><h4>${t('choose')}</h4></div>
-  <div class="pk">${ST.packages.map(p=>{
-    const d = p.old_price>p.price ? Math.round((1-p.price/p.old_price)*100) : 0;
-    return `<div class="card pkg ${ST.pkg===p.id?'sel':''}" onclick="pick(${p.id})">
-      ${d?`<div class="badge">-${d}%</div>`:''}
-      <div class="ph">${g.unit==='UC'?'🪙':g.unit==='Stars'?'⭐':g.unit==='Gold'?'🥇':'💎'}</div>
-      <div class="t">${p.title}</div><div class="p">${money(p.price)} <span style="font-size:11px;color:var(--mut)">so'm</span></div>
-      ${p.old_price?`<div class="o">${money(p.old_price)} so'm</div>`:''}</div>`;}).join('')}
-  </div>
-  <div style="margin-top:16px">
-    <input class="inp" id="pid" placeholder="${g.hint||t('idph')}">
-    ${g.need_server?`<input class="inp" id="sid" placeholder="${t('srv')}" style="margin-top:10px">`:''}
-    <button class="btn wide green" style="margin-top:12px" onclick="buy()">${t('buy')}</button>
-    <p style="color:var(--mut);font-size:12px;text-align:center">Balans: ${money(ST.user.balance)} so'm</p>
-  </div>`;
-}
-function pick(id){ST.pkg=id;render();}
+def v_stat():
+    d0 = (int(time.time()) + 18000) // 86400 * 86400 - 18000
+    n = q1("select count(*) c, coalesce(sum(balance),0) b from users")
+    new = q1("select count(*) c from users where joined>=?", (d0,))["c"]
+    tp = q1("select count(*) c, coalesce(sum(amount),0) s from topups where status='approved'")
+    tpt = q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=?", (d0,))["s"]
+    od = q1("select count(*) c, coalesce(sum(price),0) s from orders where status='done'")
+    odp = q1("select count(*) c from orders where status='pending'")["c"]
+    tpp = q1("select count(*) c from topups where status='pending'")["c"]
+    txt = (f"📊 <b>Statistika</b>\n\n👥 Foydalanuvchilar: <b>{n['c']}</b> (bugun +{new})\n💼 Umumiy balans: <b>{money(n['b'])}</b> so'm\n\n"
+           f"💰 To'ldirilgan: <b>{money(tp['s'])}</b> so'm ({tp['c']} ta)\n📅 Bugun: <b>{money(tpt)}</b> so'm\n\n"
+           f"📦 Bajarilgan buyurtmalar: <b>{od['c']}</b> ta — {money(od['s'])} so'm\n"
+           f"⏳ Kutilayotgan buyurtma: <b>{odp}</b>\n⏳ Kutilayotgan to'ldirish: <b>{tpp}</b>")
+    return txt, [[("🔄 Yangilash", "a:stat")], BACK]
 
-async function buy(){
-  if(!ST.pkg) return toast('Paketni tanlang');
-  const pid=(document.getElementById('pid').value||'').trim();
-  const sid=(document.getElementById('sid')?.value||'').trim();
-  if(pid.length<3) return toast("O'yin ID kiriting");
-  const d = await api('order',{pkg_id:ST.pkg,player_id:pid,server_id:sid});
-  if(!d.ok) return toast(d.error==="subs"?"Kanalga obuna bo'ling":d.error);
-  ST.user.balance=d.balance; TG.HapticFeedback?.notificationOccurred('success');
-  toast('✅ Buyurtma #'+d.id+' qabul qilindi');
-  go('orders');
-}
+def v_users():
+    top = qa("select * from users order by id desc limit 8")
+    rows = [[("🔎 Qidirish (ID / @username)", "a:find")]]
+    for u in top: rows.append([(f"{'🚫 ' if u['banned'] else ''}{u['name'][:22]} · {money(u['balance'])}", f"a:u:{u['id']}")])
+    rows.append(BACK)
+    return "👥 <b>Foydalanuvchilar</b>\nSo'nggi qo'shilganlar:", rows
 
-function topup(){
-  const m=ST.shop.min_topup;
-  return `
-  <div class="sec"><h4>${t('bt')}</h4></div>
-  <div class="card bal"><div class="ico">👛</div>
-    <div><small>${t('bal')}</small><b>${money(ST.user.balance)} <span style="font-size:14px;color:var(--mut)">so'm</span></b></div></div>
-  <div class="sec"><h4 style="font-size:15px">${t('pm')}</h4></div>
-  <div class="row2">
-    <div class="card" id="mUZCARD" onclick="setM('UZCARD')" style="border-color:var(--brand)">💳 UZCARD</div>
-    <div class="card" id="mHUMO" onclick="setM('HUMO')">🟠 HUMO</div>
-  </div>
-  <div class="sec"><h4 style="font-size:15px">${t('sum')}</h4></div>
-  <input class="inp" id="amt" type="number" inputmode="numeric" placeholder="${money(m)}">
-  <div class="row2" style="grid-template-columns:repeat(4,1fr);margin-top:10px">
-    ${[50000,100000,200000,500000].map(v=>`<div class="card" style="padding:10px;font-size:13px" onclick="document.getElementById('amt').value=${v}">${v/1000}k</div>`).join('')}
-  </div>
-  <p style="color:var(--mut);font-size:12px">${t('min')}: ${money(m)} so'm</p>
-  <div class="card steps" style="margin-top:8px">
-    ${t('steps').map((s,i)=>`<div><i>${i+1}</i><span>${s}</span></div>`).join('')}
-  </div>
-  <button class="btn wide green" style="margin-top:14px" onclick="doTopup()">${t('cont')}</button>`;
-}
-let METHOD='UZCARD';
-function setM(m){METHOD=m;
-  document.getElementById('mUZCARD').style.borderColor = m==='UZCARD'?'var(--brand)':'var(--line)';
-  document.getElementById('mHUMO').style.borderColor  = m==='HUMO'?'var(--brand)':'var(--line)';}
+def v_user(uid):
+    u = q1("select * from users where id=?", (uid,))
+    if not u: return "Topilmadi", [BACK]
+    oc = q1("select count(*) c from orders where uid=?", (uid,))["c"]
+    txt = (f"👤 {ulink(u)}\n@{E(u['username'] or '-')}\n💰 Balans: <b>{money(u['balance'])}</b> so'm\n"
+           f"📦 Buyurtmalar: {oc}\n🌐 Til: {u['lang']}\n📅 {ts(u['joined'] or 0)}\n{'🚫 BLOKLANGAN' if u['banned'] else ''}")
+    return txt, [[("➕ Balans qo'shish", f"a:bal:{uid}:+"), ("➖ Balans ayirish", f"a:bal:{uid}:-")],
+                 [("✅ Blokdan chiqarish" if u["banned"] else "🚫 Bloklash", f"a:ban:{uid}")],
+                 [("🔙 Userlar", "a:users")]]
 
-async function doTopup(){
-  const a=parseInt(document.getElementById('amt').value||0);
-  const d=await api('topup',{amount:a,method:METHOD});
-  if(!d.ok) return toast(d.error);
-  ST.pay={id:d.id,amount:a,card:d.card,holder:d.holder,method:d.method};
-  ST.tab='pay'; render();
-}
-function payPage(){
-  const p=ST.pay;
-  return `
-  <div class="sec"><h4>${t('wait')}</h4></div>
-  <div class="card pay">
-    <small style="color:var(--mut);letter-spacing:.08em">AYNAN</small>
-    <div class="amt">${money(p.amount)} <span style="font-size:15px;color:var(--mut)">so'm</span></div>
-    <button class="btn gray" onclick="copy('${p.amount}')">⧉ Summani nusxalash</button>
-  </div>
-  <div class="card pay" style="margin-top:10px">
-    <small style="color:var(--mut)">Shu kartaga o'tkazing · ${p.method}</small>
-    <div class="card-no">${p.card}</div>
-    <div style="color:var(--mut);font-size:13px;margin-bottom:10px">${p.holder}</div>
-    <button class="btn gray" onclick="copy('${p.card.replace(/\s/g,'')}')">⧉ ${t('copy')}</button>
-  </div>
-  <div class="card" style="padding:14px;margin-top:10px;font-size:13px;line-height:1.9">
-    ✅ Summani birlikka ham o'zgartirmang<br>
-    ✅ 15 daqiqa ichida to'lang<br>
-    ❌ Boshqa summa yubormang<br>
-    ❌ Summani bo'lib, ikki marta yubormang
-  </div>
-  <button class="btn wide green" style="margin-top:14px" onclick="TG.close()">📸 Chekni botga yuborish</button>
-  <button class="btn wide gray" style="margin-top:8px" onclick="go('topup')">⬅️ Orqaga</button>`;
-}
+def v_games():
+    rows = [[("➕ O'yin qo'shish", "a:gnew")]]
+    for g in qa("select * from games order by sort,id"):
+        rows.append([(f"{'🟢' if g['active'] else '🔴'} {'🎁' if g['cat']=='promo' else '🎮'} {g['name']}", f"a:g:{g['id']}")])
+    rows.append(BACK)
+    return "🎮 <b>O'yinlar</b>\nO'yinni tanlab, rasm/nom/mahsulot va narxlarni o'zgartiring:", rows
 
-async function orders(){
-  const d=await api('orders'); ST.orders=d.orders||[]; ST.topups=d.topups||[];
-  V.innerHTML = ordersHTML(); return '';
-}
-function ordersHTML(){
-  const badge=s=>`<span class="st ${s}">${s==='done'?'✅ Bajarildi':s==='pending'?'⏳ Kutilmoqda':s==='new'?'⏳ Yangi':'❌ Rad etildi'}</span>`;
-  if(!ST.orders.length && !ST.topups.length)
-    return `<div class="empty"><div>🕘</div><b>${t('noord')}</b><p>${t('noord2')}</p></div>`;
-  return `<div class="sec"><h4>${t('orders')}</h4></div>
-  <div class="card list">${ST.orders.map(o=>`<div class="it">
-    <div>🎮</div><div><div style="font-weight:700;font-size:14px">${o.title}</div>
-    <div style="color:var(--mut);font-size:12px">#${o.id} · ${o.player_id} · ${money(o.amount)} so'm</div></div>
-    ${badge(o.status)}</div>`).join('') || '<div class="it">—</div>'}</div>
-  <div class="sec"><h4>${t('tx')}</h4></div>
-  <div class="card list">${ST.topups.map(o=>`<div class="it">
-    <div>💳</div><div><div style="font-weight:700;font-size:14px">+${money(o.amount)} so'm</div>
-    <div style="color:var(--mut);font-size:12px">#${o.id} · ${o.method}</div></div>
-    ${badge(o.status)}</div>`).join('') || '<div class="it">—</div>'}</div>`;
-}
+def v_game(gid):
+    g = q1("select * from games where id=?", (gid,))
+    if not g: return "Topilmadi", [[("🔙", "a:games")]]
+    ps = qa("select * from products where game_id=? order by price,id", (gid,))
+    txt = (f"🎮 <b>{E(g['name'])}</b>\nKategoriya: {'Promokodlar' if g['cat']=='promo' else 'O`yinlar'}\n"
+           f"ID maydoni: <i>{E(g['field'])}</i>\nRasm: {'✅' if g['img'] else '❌'}\nHolat: {'faol' if g['active'] else 'o`chirilgan'}\n"
+           f"Mahsulotlar: {len(ps)} ta")
+    rows = [[("➕ Mahsulot qo'shish", f"a:padd:{gid}")]]
+    for p in ps: rows.append([(f"{'🟢' if p['active'] else '🔴'} {(p['grp']+' · ') if p['grp'] else ''}{p['name']} — {money(p['price'])}", f"a:p:{p['id']}")])
+    rows += [[("🖼 Banner (katta rasm)", f"a:ghero:{gid}"), ("💎 Mahsulot ikonkasi", f"a:gpicon:{gid}")],
+             [("🖼 Guruhga rasm", f"a:pgimg:{gid}"), ("ℹ️ Info qator", f"a:ginfo:{gid}")],
+             [("✏️ Nom", f"a:gname:{gid}"), ("🖼 Kichik ikonka", f"a:gimg:{gid}")],
+             [("🔤 ID maydoni nomi", f"a:gfield:{gid}"), ("📂 Kategoriya", f"a:gcat2:{gid}")],
+             [("👁 Yoqish/O'chirish", f"a:gtog:{gid}"), ("🗑 O'yinni o'chirish", f"a:gdel:{gid}")],
+             [("🔙 O'yinlar", "a:games")]]
+    return txt, rows
 
-function profile(){
-  const link=`https://t.me/${(TG.initDataUnsafe?.user?.username?'':'')}`;
-  const ppu = TG.initDataUnsafe?.user?.photo_url;
-  const bigAv = ppu
-    ? `<img class="av" style="width:96px;height:96px" src="${ppu}">`
-    : `<div class="av" style="width:96px;height:96px;margin:0 auto;display:grid;place-items:center;font-size:34px;background:linear-gradient(135deg,${grad(ST.user.name||'U')})">${(ST.user.name||'U')[0].toUpperCase()}</div>`;
-  return `
-  <div class="card" style="padding:20px;text-align:center">
-    ${bigAv}
-    <h3 style="margin:10px 0 4px;text-transform:uppercase">${ST.user.name}</h3>
-    <div style="color:var(--mut);font-size:12px">ID: ${ST.user.id}</div>
-    <div class="card bal" style="margin-top:14px"><div class="ico">👛</div>
-      <div style="text-align:left"><small>${t('bal')}</small><b>${money(ST.user.balance)} <span style="font-size:14px;color:var(--mut)">so'm</span></b></div>
-      <button class="btn" style="margin-left:auto" onclick="go('topup')">+ ${t('topup')}</button></div>
-  </div>
-  <div class="card" style="padding:16px;margin-top:12px">
-    <b>🎟 ${t('promo')}</b>
-    <div style="display:flex;gap:8px;margin-top:10px">
-      <input class="inp" id="pc" placeholder="PROMOKOD" style="text-transform:uppercase">
-      <button class="btn" onclick="usePromo()">OK</button></div>
-  </div>
-  <div class="card" style="padding:16px;margin-top:12px">
-    <b>👥 ${t('ref')}</b>
-    <p style="color:var(--mut);font-size:13px;margin:6px 0 10px">
-      Havolangiz orqali qo'shilgan har bir do'stingiz uchun ${money(ST.shop.ref_bonus)} so'm bonus.</p>
-    <div class="inp" style="font-size:13px;overflow:hidden;white-space:nowrap" id="rl">t.me/?start=ref${ST.user.id}</div>
-    <div class="row2">
-      <button class="btn" onclick="shareRef()">🔗 ${t('share')}</button>
-      <div class="card" style="padding:12px"><b style="font-size:18px">${ST.user.refs}</b>
-        <div style="font-size:10px;color:var(--mut)">${t('invited')}</div></div></div>
-  </div>
-  <button class="btn wide gray" style="margin-top:12px" onclick="TG.close()">${t('out')}</button>`;
-}
-async function usePromo(){
-  const c=document.getElementById('pc').value.trim();
-  if(!c) return;
-  const d=await api('promo',{code:c});
-  if(!d.ok) return toast(d.error);
-  ST.user.balance=d.balance; toast('✅ +'+money(d.amount)+" so'm"); render();
-}
-function shareRef(){
-  const bot = 'https://t.me/' + (location.hostname.includes('.')?'':'');
-  const link = 'https://t.me/share/url?url=' + encodeURIComponent('https://t.me/?start=ref'+ST.user.id);
-  TG.openTelegramLink(link);
-}
+def v_prod(pid):
+    p = q1("select * from products where id=?", (pid,))
+    if not p: return "Topilmadi", [[("🔙", "a:games")]]
+    return (f"📦 <b>{E(p['name'])}</b>\n💰 {money(p['price'])} so'm\nGuruh: {E(p['grp'] or '-')} · Belgi: {E(p['badge'] or '-')} · Rasm: {'✅' if p['img'] else '❌'}\nHolat: {'faol' if p['active'] else 'o`chirilgan'}",
+            [[("✏️ Nom", f"a:pname:{pid}"), ("💰 Narx", f"a:pprice:{pid}")],
+             [("🖼 Rasm", f"a:pimg:{pid}"), ("📂 Guruh", f"a:pgrp:{pid}"), ("🏷 Belgi", f"a:pbadge:{pid}")],
+             [("👁 Yoqish/O'chirish", f"a:ptog:{pid}"), ("🗑 O'chirish", f"a:pdel:{pid}")],
+             [("🔙 O'yin", f"a:g:{p['game_id']}")]])
 
-function go(tab){ST.tab=tab; if(tab==='orders'){orders();document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.t==='orders'));return;} render();}
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>go(b.dataset.t));
-document.getElementById('thBtn').onclick=e=>{
-  document.body.classList.toggle('dark');
-  e.target.textContent = document.body.classList.contains('dark')?'☀️':'🌙';};
-document.getElementById('langBtn').onclick=()=>{
-  const m=document.getElementById('langMenu'); m.style.display = m.style.display==='none'?'block':'none';};
-document.querySelectorAll('#langMenu button').forEach(b=>b.onclick=async()=>{
-  ST.lang=b.dataset.l; document.getElementById('langMenu').style.display='none';
-  document.getElementById('langBtn').textContent='🌐 '+ST.lang.toUpperCase();
-  await api('lang',{lang:ST.lang}); render();});
-if(TG.colorScheme==='dark'){document.body.classList.add('dark');document.getElementById('thBtn').textContent='☀️';}
-boot();
-</script></body></html>"""
+def v_banners():
+    bs = qa("select * from banners order by id")
+    rows = [[("➕ Banner qo'shish", "a:badd")]]
+    for b in bs: rows.append([(f"🗑 Banner #{b['id']} {('→ '+b['link'][:25]) if b['link'] else ''}", f"a:bdel:{b['id']}")])
+    rows.append(BACK)
+    return f"🖼 <b>Bannerlar</b> ({len(bs)} ta)\nIlova bosh sahifasidagi reklama bannerlari. O'chirish uchun bosing.", rows
 
+def v_cards():
+    cs = qa("select * from cards order by id")
+    rows = [[("➕ Karta qo'shish", "a:cadd")]]
+    for c in cs: rows.append([(f"{'🟢' if c['active'] else '🔴'} {c['bank']} {c['number']} · {c['holder']}", f"a:c:{c['id']}")])
+    rows.append(BACK)
+    return ("💳 <b>Kartalar</b>\nTo'ldirishda faol kartalardan biri tasodifiy beriladi.\nKartasiz to'ldirish ishlamaydi!", rows)
 
-# ----------------------------------------------------------------------------
-# RUN
-# ----------------------------------------------------------------------------
-def run_flask():
-    from waitress import serve
-    serve(app, host="0.0.0.0", port=PORT, threads=8)
+def v_card(cid):
+    c = q1("select * from cards where id=?", (cid,))
+    if not c: return "Topilmadi", [[("🔙", "a:cards")]]
+    return (f"💳 <code>{E(c['number'])}</code>\n👤 {E(c['holder'])}\n🏦 {E(c['bank'])}\nHolat: {'faol' if c['active'] else 'o`chirilgan'}",
+            [[("✏️ Almashtirish (raqam | ism | bank)", f"a:cedit:{cid}")],
+             [("👁 Yoqish/O'chirish", f"a:ctog:{cid}"), ("🗑 O'chirish", f"a:cdel:{cid}")], [("🔙 Kartalar", "a:cards")]])
 
+def v_tops():
+    ts_ = qa("select * from topups where status='pending' order by id desc limit 15")
+    rows = [[(f"#{t['id']} · {money(t['amount'])} · {ts(t['created'])}", f"a:t:{t['id']}")] for t in ts_]
+    rows.append(BACK)
+    return f"💰 <b>Kutilayotgan to'ldirishlar</b> ({len(ts_)})", rows
+
+def v_top(tid):
+    t = q1("select * from topups where id=?", (tid,))
+    if not t: return "Topilmadi", [[("🔙", "a:tops")]]
+    u = q1("select * from users where id=?", (t["uid"],)) or {"id": t["uid"], "name": ""}
+    rows = [[("✅ Tasdiqlash", f"t:ok:{tid}"), ("❌ Rad etish", f"t:no:{tid}")]] if t["status"] == "pending" else []
+    rows.append([("🔙", "a:tops")])
+    return f"💳 To'ldirish #{tid}\n👤 {ulink(u)}\n💰 {money(t['amount'])} so'm\nHolat: <b>{t['status']}</b>", rows
+
+def v_ords():
+    os_ = qa("select * from orders where status='pending' order by id desc limit 15")
+    rows = [[(f"#{o['id']} {o['game']} · {o['product']} · {money(o['price'])}", f"a:o:{o['id']}")] for o in os_]
+    rows.append(BACK)
+    return f"📦 <b>Kutilayotgan buyurtmalar</b> ({len(os_)})", rows
+
+def v_ord(oid):
+    o = q1("select * from orders where id=?", (oid,))
+    if not o: return "Topilmadi", [[("🔙", "a:ords")]]
+    u = q1("select * from users where id=?", (o["uid"],)) or {"id": o["uid"], "name": ""}
+    rows = [[("✅ Bajarildi", f"o:done:{oid}"), ("❌ Bekor (qaytarish)", f"o:no:{oid}")]] if o["status"] == "pending" else []
+    rows.append([("🔙", "a:ords")])
+    return (f"📦 Buyurtma #{oid}\n👤 {ulink(u)}\n🎮 {E(o['game'])} — {E(o['product'])}\n🆔 <code>{E(o['player'])}</code>\n"
+            f"💰 {money(o['price'])} so'm\nHolat: <b>{o['status']}</b>"), rows
+
+def v_promos():
+    ps = qa("select * from promos")
+    rows = [[("➕ Promokod qo'shish", "a:pradd")]]
+    for p in ps: rows.append([(f"🗑 {p['code']} · {money(p['amount'])} · qolgan {p['left']}", f"a:prdel:{p['code']}")])
+    rows.append(BACK)
+    return "🎟 <b>Promokodlar</b>\nBalansga pul beradigan kodlar. O'chirish uchun bosing.", rows
+
+def v_chs():
+    cs = qa("select * from channels")
+    rows = [[("➕ Kanal/guruh qo'shish", "a:chadd")]]
+    for c in cs: rows.append([(f"🗑 {c['title'] or c['chat_id']}", f"a:chdel:{c['id']}")])
+    rows.append(BACK)
+    return "📢 <b>Majburiy obuna</b>\nBot kanalda ADMIN bo'lishi shart.", rows
+
+SET_KEYS = [("bot_name", "Bot nomi"), ("welcome_uz", "Salomlashuv (UZ)"), ("welcome_ru", "Salomlashuv (RU)"),
+            ("welcome_img", "Salomlashuv rasmi"), ("support_link", "Yordam havolasi"), ("channel_link", "Kanal havolasi"),
+            ("min_topup", "Minimal to'ldirish (so'm)"), ("card_ttl", "Karta amal qilish vaqti (daqiqa)")]
+
+def v_set():
+    rows = [[(f"✏️ {lbl}", f"a:s:{k}")] for k, lbl in SET_KEYS]
+    m = gs("maintenance") == "1"
+    rows.append([(f"🛠 Texnik ishlar: {'YOQIQ' if m else 'o`chiq'}", "a:s:maintenance")])
+    rows.append(BACK)
+    txt = "⚙️ <b>Sozlamalar</b>\n\n" + "\n".join(
+        f"• {lbl}: <code>{E((gs(k) or '-')[:40])}</code>" for k, lbl in SET_KEYS if k != "welcome_img")
+    return txt + "\n\nSalomlashuv matnida <code>{name}</code> — foydalanuvchi ismi.", rows
+
+def v_adms():
+    rows = [[("➕ Admin qo'shish", "a:amadd")]]
+    for r in qa("select id from admins"): rows.append([(f"🗑 {r['id']}", f"a:amdel:{r['id']}")])
+    rows.append(BACK)
+    return f"👮 <b>Adminlar</b>\nAsosiy (ENV): {', '.join(map(str, OWNERS)) or '-'}", rows
+
+async def ask(update, ctx, st, text):
+    ctx.user_data["st"] = st
+    await show(update, (text + "\n\n<i>Bekor qilish: /cancel</i>", [[("🔙 Bekor", "a:home")]]))
+
+async def cmd_admin(update, ctx):
+    if not is_admin(update.effective_user.id): return
+    ctx.user_data.pop("st", None)
+    rows = [[InlineKeyboardButton("🛠 Admin panelni ochish", web_app=WebAppInfo(url=webapp_url() + "?admin=1"))],
+            [InlineKeyboardButton("💬 Chat ichidagi panel", callback_data="a:home")]]
+    await update.message.reply_text("🛠 <b>SYREXA Admin</b>\nRasm, narx, karta — hammasini qulay panelda o'zgartiring:",
+                                    reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML")
+
+async def cmd_cancel(update, ctx):
+    ctx.user_data.pop("st", None)
+    if is_admin(update.effective_user.id): await show(update, v_home())
+
+async def adm_cb(update, ctx):
+    q = update.callback_query
+    if not is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
+    await q.answer()
+    d = q.data.split(":"); a = d[1]; x = d[2] if len(d) > 2 else None
+    ctx.user_data.pop("st", None) if a in ("home", "stat", "users", "games", "banners", "cards", "tops", "ords", "promos", "chs", "set", "adms") else None
+    S = lambda v: show(update, v)
+    if a == "home": return await S(v_home())
+    if a == "stat": return await S(v_stat())
+    if a == "users": return await S(v_users())
+    if a == "find": return await ask(update, ctx, ("find",), "🔎 Foydalanuvchi ID yoki @username yuboring:")
+    if a == "u": return await S(v_user(int(x)))
+    if a == "bal": return await ask(update, ctx, ("bal", int(x), d[3]), f"{'➕ Qo`shiladigan' if d[3]=='+' else '➖ Ayiriladigan'} summani yuboring (so'm):")
+    if a == "ban":
+        u = q1("select banned from users where id=?", (int(x),))
+        ex("update users set banned=? where id=?", (0 if u["banned"] else 1, int(x)))
+        return await S(v_user(int(x)))
+    # games
+    if a == "games": return await S(v_games())
+    if a == "gnew": return await ask(update, ctx, ("gnew",), "🎮 Yangi o'yin nomini yuboring:")
+    if a == "gcat":
+        name = ctx.user_data.get("gname", "Yangi")
+        gid = ex("insert into games(name,cat,sort) values(?,?,?)", (name, x, int(time.time()) % 100000)).lastrowid
+        return await ask(update, ctx, ("gimg", gid), f"✅ «{E(name)}» qo'shildi.\n🖼 Endi o'yin rasmini yuboring (yoki /cancel):")
+    if a == "g": return await S(v_game(int(x)))
+    if a == "gname": return await ask(update, ctx, ("gname", int(x)), "✏️ Yangi nomni yuboring:")
+    if a == "gimg": return await ask(update, ctx, ("gimg", int(x)), "🖼 Rasmni yuboring (rasm sifatida):")
+    if a == "gfield": return await ask(update, ctx, ("gfield", int(x)), "🔤 Foydalanuvchi to'ldiradigan maydon nomi (masalan: Player ID, UID, Telegram username):")
+    if a == "ghero": return await ask(update, ctx, ("ghero", int(x)), "🖼 O'yin sahifasi tepasidagi KATTA banner rasmini yuboring (gorizontal, rasm sifatida):")
+    if a == "gpicon": return await ask(update, ctx, ("gpicon", int(x)), "💎 Mahsulotlar uchun umumiy ikonka yuboring (masalan UC rasmi). Alohida rasmi yo'q mahsulotlar shuni ishlatadi:")
+    if a == "ginfo": return await ask(update, ctx, ("ginfo", int(x)), "ℹ️ Format: <code>matn | havola</code>\nMasalan: <code>MLBB News Channel | https://t.me/kanal</code>\nO'chirish: <code>-</code>")
+    if a == "pgimg": return await ask(update, ctx, ("pgname", int(x)), "📂 Qaysi guruhga rasm qo'yamiz? Guruh nomini yuboring (masalan: UC). Guruhsiz mahsulotlar uchun <code>-</code>")
+    if a == "pimg": return await ask(update, ctx, ("pimg", int(x)), "🖼 Mahsulot rasmini yuboring:")
+    if a == "pgrp": return await ask(update, ctx, ("pgrp", int(x)), "📂 Guruh (tab) nomi, masalan: UC, Prime, Diamonds, RU. Tozalash: <code>-</code>")
+    if a == "pbadge": return await ask(update, ctx, ("pbadge", int(x)), "🏷 Belgi matni, masalan: 2x, EP, HIT. Tozalash: <code>-</code>")
+    if a == "gcat2":
+        g = q1("select cat from games where id=?", (int(x),))
+        ex("update games set cat=? where id=?", ("promo" if g["cat"] == "game" else "game", int(x)))
+        return await S(v_game(int(x)))
+    if a == "gtog":
+        ex("update games set active=1-active where id=?", (int(x),)); return await S(v_game(int(x)))
+    if a == "gdel":
+        return await S(("⚠️ O'yin va uning barcha mahsulotlari o'chiriladi. Ishonchingiz komilmi?",
+                        [[("✅ Ha, o'chirish", f"a:gdel2:{x}"), ("❌ Yo'q", f"a:g:{x}")]]))
+    if a == "gdel2":
+        ex("delete from products where game_id=?", (int(x),)); ex("delete from games where id=?", (int(x),))
+        return await S(v_games())
+    if a == "padd": return await ask(update, ctx, ("padd", int(x)),
+        "➕ Mahsulot(lar)ni yuboring. Har qatorda: <code>nom | narx | guruh | belgi</code> (guruh va belgi ixtiyoriy)\nMasalan:\n<code>60 UC | 11700 | UC\n325 UC | 59000 | UC\nPrime | 12000 | Prime | HIT</code>")
+    if a == "p": return await S(v_prod(int(x)))
+    if a == "pname": return await ask(update, ctx, ("pname", int(x)), "✏️ Yangi mahsulot nomi:")
+    if a == "pprice": return await ask(update, ctx, ("pprice", int(x)), "💰 Yangi narx (so'm):")
+    if a == "ptog":
+        ex("update products set active=1-active where id=?", (int(x),)); return await S(v_prod(int(x)))
+    if a == "pdel":
+        p = q1("select game_id from products where id=?", (int(x),)); ex("delete from products where id=?", (int(x),))
+        return await S(v_game(p["game_id"]) if p else v_games())
+    # banners
+    if a == "banners": return await S(v_banners())
+    if a == "badd": return await ask(update, ctx, ("badd",), "🖼 Banner rasmini yuboring. Ixtiyoriy: izohga havola (https://...) yozsangiz, bosilganda ochiladi.")
+    if a == "bdel": ex("delete from banners where id=?", (int(x),)); return await S(v_banners())
+    # cards
+    if a == "cards": return await S(v_cards())
+    if a == "cadd": return await ask(update, ctx, ("cadd",), "💳 Format: <code>karta raqami | Ism Familiya | Bank</code>\nMasalan: <code>8600123412341234 | Ali Valiyev | UZCARD</code>")
+    if a == "c": return await S(v_card(int(x)))
+    if a == "cedit": return await ask(update, ctx, ("cedit", int(x)), "✏️ Yangi ma'lumot: <code>karta raqami | Ism Familiya | Bank</code>")
+    if a == "ctog": ex("update cards set active=1-active where id=?", (int(x),)); return await S(v_card(int(x)))
+    if a == "cdel": ex("delete from cards where id=?", (int(x),)); return await S(v_cards())
+    # topups / orders
+    if a == "tops": return await S(v_tops())
+    if a == "t": return await S(v_top(int(x)))
+    if a == "ords": return await S(v_ords())
+    if a == "o": return await S(v_ord(int(x)))
+    # promos
+    if a == "promos": return await S(v_promos())
+    if a == "pradd": return await ask(update, ctx, ("pradd",), "🎟 Format: <code>KOD | summa | necha kishi ishlata oladi</code>\nMasalan: <code>FREE5000 | 5000 | 100</code>")
+    if a == "prdel": ex("delete from promos where code=?", (x,)); return await S(v_promos())
+    # channels
+    if a == "chs": return await S(v_chs())
+    if a == "chadd": return await ask(update, ctx, ("chadd",), "📢 Kanal @username yoki ID yuboring (bot u yerda admin bo'lsin).\nMasalan: <code>@mychannel</code>")
+    if a == "chdel": ex("delete from channels where id=?", (int(x),)); return await S(v_chs())
+    # broadcast
+    if a == "bc": return await ask(update, ctx, ("bc",), "📨 Barcha foydalanuvchilarga yuboriladigan xabarni yuboring (matn, rasm, video — istalgan):")
+    if a == "bcgo":
+        st = ctx.user_data.pop("bcmsg", None)
+        if not st: return await S(v_home())
+        await q.edit_message_text("⏳ Yuborilmoqda...")
+        ok = bad = 0
+        for u in qa("select id from users where banned=0"):
+            try:
+                await ctx.bot.copy_message(u["id"], st[0], st[1]); ok += 1
+            except Exception: bad += 1
+            await asyncio.sleep(0.05)
+        return await q.message.reply_text(f"✅ Yuborildi: {ok}\n❌ Xato: {bad}", reply_markup=AK([BACK]))
+    # settings
+    if a == "set": return await S(v_set())
+    if a == "s":
+        if x == "maintenance":
+            ss("maintenance", "0" if gs("maintenance") == "1" else "1"); return await S(v_set())
+        lbl = dict(SET_KEYS).get(x, x)
+        extra = "\n(rasm yuboring)" if x == "welcome_img" else ""
+        return await ask(update, ctx, ("set", x), f"✏️ <b>{lbl}</b>\nHozirgi: <code>{E((gs(x) or '-')[:300])}</code>{extra}\nYangi qiymatni yuboring:")
+    # admins
+    if a == "adms": return await S(v_adms())
+    if a == "amadd": return await ask(update, ctx, ("amadd",), "👮 Yangi admin Telegram ID sini yuboring:")
+    if a == "amdel":
+        if int(x) not in OWNERS: ex("delete from admins where id=?", (int(x),))
+        return await S(v_adms())
+
+async def on_msg(update, ctx):
+    u = update.effective_user; m = update.message
+    if not u or not m or not is_admin(u.id): return
+    st = ctx.user_data.get("st")
+    if not st: return
+    k = st[0]; txt = (m.text or m.caption or "").strip()
+    photo = m.photo[-1].file_id if m.photo else None
+    done = lambda: ctx.user_data.pop("st", None)
+    num = lambda s: int(re.sub(r"\D", "", s) or 0)
+    try:
+        if k == "find":
+            s = txt.lstrip("@")
+            r = q1("select id from users where id=?", (int(s),)) if s.isdigit() else q1("select id from users where lower(username)=?", (s.lower(),))
+            if not r: return await m.reply_text("❌ Topilmadi. Qayta yuboring yoki /cancel")
+            done(); return await show(update, v_user(r["id"]))
+        if k == "bal":
+            amt = num(txt)
+            if amt <= 0: return await m.reply_text("Musbat son yuboring")
+            _, uid, sign = st
+            ex("update users set balance=max(0,balance+?) where id=?", (amt if sign == "+" else -amt, uid))
+            notify(uid, f"{'➕' if sign=='+' else '➖'} Balansingiz o'zgardi: <b>{money(amt)}</b> so'm")
+            done(); return await show(update, v_user(uid))
+        if k == "gnew":
+            if not txt: return await m.reply_text("Nom yuboring")
+            ctx.user_data["gname"] = txt; done()
+            return await show(update, (f"«{E(txt)}» uchun kategoriya:", [[("🎮 O'yinlar", "a:gcat:game"), ("🎁 Promokodlar bo'limi", "a:gcat:promo")]]))
+        if k == "gname":
+            ex("update games set name=? where id=?", (txt, st[1])); done(); return await show(update, v_game(st[1]))
+        if k == "gfield":
+            ex("update games set field=? where id=?", (txt, st[1])); done(); return await show(update, v_game(st[1]))
+        if k == "gimg":
+            if not photo: return await m.reply_text("Rasm yuboring (fayl emas, rasm sifatida)")
+            ex("update games set img=? where id=?", (photo, st[1])); done(); return await show(update, v_game(st[1]))
+        if k in ("ghero", "gpicon", "pimg"):
+            if not photo: return await m.reply_text("Rasm yuboring (fayl emas, rasm sifatida)")
+            if k == "pimg":
+                ex("update products set img=? where id=?", (photo, st[1])); done(); return await show(update, v_prod(st[1]))
+            ex(f"update games set {'hero' if k=='ghero' else 'picon'}=? where id=?", (photo, st[1])); done(); return await show(update, v_game(st[1]))
+        if k == "ginfo":
+            ex("update games set info=? where id=?", ("" if txt == "-" else txt, st[1])); done(); return await show(update, v_game(st[1]))
+        if k in ("pgrp", "pbadge"):
+            ex(f"update products set {'grp' if k=='pgrp' else 'badge'}=? where id=?", ("" if txt == "-" else txt, st[1])); done(); return await show(update, v_prod(st[1]))
+        if k == "pgname":
+            return await ask(update, ctx, ("pgimg", st[1], "" if txt == "-" else txt), f"🖼 «{E(txt)}» guruhidagi barcha mahsulotlar uchun rasm yuboring:")
+        if k == "pgimg":
+            if not photo: return await m.reply_text("Rasm yuboring")
+            ex("update products set img=? where game_id=? and grp=?", (photo, st[1], st[2])); done(); return await show(update, v_game(st[1]))
+        if k == "padd":
+            n = 0
+            for line in txt.splitlines():
+                pt = [x.strip() for x in line.split("|")]
+                if len(pt) >= 2 and pt[0] and num(pt[1]) > 0:
+                    ex("insert into products(game_id,name,price,grp,badge) values(?,?,?,?,?)",
+                       (st[1], pt[0], num(pt[1]), pt[2] if len(pt) > 2 else "", pt[3] if len(pt) > 3 else "")); n += 1
+            if not n: return await m.reply_text("Format xato. <code>nom | narx</code>", parse_mode="HTML")
+            done(); return await show(update, v_game(st[1]))
+        if k == "pname":
+            ex("update products set name=? where id=?", (txt, st[1])); done(); return await show(update, v_prod(st[1]))
+        if k == "pprice":
+            if num(txt) <= 0: return await m.reply_text("Narx noto'g'ri")
+            ex("update products set price=? where id=?", (num(txt), st[1])); done(); return await show(update, v_prod(st[1]))
+        if k == "badd":
+            if not photo: return await m.reply_text("Rasm yuboring")
+            ex("insert into banners(img,link) values(?,?)", (photo, txt if link_ok(txt) else "")); done(); return await show(update, v_banners())
+        if k in ("cadd", "cedit"):
+            parts = [p.strip() for p in txt.split("|")]
+            if len(parts) < 2 or len(re.sub(r"\D", "", parts[0])) < 12: return await m.reply_text("Format: karta | ism | bank")
+            number = re.sub(r"\D", "", parts[0]); number = " ".join(number[i:i+4] for i in range(0, len(number), 4))
+            bank = parts[2].upper() if len(parts) > 2 and parts[2] else "UZCARD"
+            if k == "cadd": ex("insert into cards(number,holder,bank) values(?,?,?)", (number, parts[1], bank)); done(); return await show(update, v_cards())
+            ex("update cards set number=?,holder=?,bank=? where id=?", (number, parts[1], bank, st[1])); done(); return await show(update, v_card(st[1]))
+        if k == "pradd":
+            parts = [p.strip() for p in txt.split("|")]
+            if len(parts) < 3 or num(parts[1]) <= 0: return await m.reply_text("Format: KOD | summa | limit")
+            ex("insert or replace into promos(code,amount,left) values(?,?,?)", (parts[0].upper(), num(parts[1]), num(parts[2]))); done(); return await show(update, v_promos())
+        if k == "chadd":
+            cid = txt.strip()
+            r = tg("getChat", chat_id=cid)
+            if not r.get("ok"): return await m.reply_text("❌ Kanal topilmadi yoki bot u yerda yo'q.")
+            c = r["result"]; link = f"https://t.me/{c['username']}" if c.get("username") else c.get("invite_link", "")
+            if not link:
+                link = tg("exportChatInviteLink", chat_id=c["id"]).get("result", "")
+            ex("insert into channels(chat_id,title,link) values(?,?,?)", (str(c["id"]), c.get("title", ""), link)); done(); return await show(update, v_chs())
+        if k == "bc":
+            ctx.user_data["bcmsg"] = (m.chat_id, m.message_id); done()
+            n = q1("select count(*) c from users where banned=0")["c"]
+            return await show(update, (f"📨 Shu xabar {n} ta foydalanuvchiga yuboriladi. Tasdiqlaysizmi?", [[("✅ Yuborish", "a:bcgo"), ("❌ Bekor", "a:home")]]))
+        if k == "set":
+            key = st[1]
+            if key == "welcome_img":
+                if not photo: return await m.reply_text("Rasm yuboring")
+                ss(key, photo)
+            else:
+                ss(key, re.sub(r"\D", "", txt) if key in ("min_topup", "card_ttl") else txt)
+            done(); return await show(update, v_set())
+        if k == "amadd":
+            if not txt.isdigit(): return await m.reply_text("ID raqam yuboring")
+            ex("insert or ignore into admins values(?)", (int(txt),)); done(); return await show(update, v_adms())
+    except Exception as e:
+        log.exception("on_msg")
+        await m.reply_text(f"Xato: {e}")
+
+# ---- topup / order decisions (button in notification or panel)
+async def cb_decide(update, ctx):
+    q = update.callback_query
+    if not is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
+    kind, act, sid = q.data.split(":"); sid = int(sid)
+    res = "Allaqachon ko'rilgan"
+    if kind == "t":
+        t = q1("select * from topups where id=?", (sid,))
+        if t:
+            st = "approved" if act == "ok" else "rejected"
+            c = ex("update topups set status=? where id=? and status in ('new','pending')", (st, sid))
+            if c.rowcount:
+                if act == "ok":
+                    ex("update users set balance=balance+? where id=?", (t["amount"], t["uid"]))
+                    notify(t["uid"], f"✅ Balansingiz <b>{money(t['amount'])}</b> so'mga to'ldirildi.")
+                    res = f"✅ Tasdiqlandi (@{E(q.from_user.username or str(q.from_user.id))})"
+                else:
+                    notify(t["uid"], f"❌ {money(t['amount'])} so'm to'ldirish so'rovi rad etildi. Yordam: support.")
+                    res = "❌ Rad etildi"
+    else:
+        o = q1("select * from orders where id=?", (sid,))
+        if o:
+            st = "done" if act == "done" else "canceled"
+            c = ex("update orders set status=? where id=? and status='pending'", (st, sid))
+            if c.rowcount:
+                if act == "done":
+                    notify(o["uid"], f"✅ Buyurtma #{sid} bajarildi!\n🎮 {E(o['game'])} — {E(o['product'])}")
+                    res = "✅ Bajarildi"
+                else:
+                    ex("update users set balance=balance+? where id=?", (o["price"], o["uid"]))
+                    notify(o["uid"], f"❌ Buyurtma #{sid} bekor qilindi, <b>{money(o['price'])}</b> so'm balansga qaytarildi.")
+                    res = "❌ Bekor qilindi, pul qaytarildi"
+    await q.answer(res, show_alert=False)
+    try:
+        await q.edit_message_text((q.message.text_html or "") + f"\n\n<b>{res}</b>", parse_mode="HTML")
+    except Exception: pass
+
+async def post_init(app):
+    if BASE_URL:
+        try:
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Ilova", web_app=WebAppInfo(url=webapp_url())))
+        except Exception as e: log.warning("menu button: %s", e)
+
+def keepalive():
+    while True:
+        time.sleep(600)
+        try: requests.get(BASE_URL + "/health", timeout=15)
+        except Exception: pass
 
 def main():
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN yo'q! Environment variable qo'ying.")
+    if not TOKEN: raise SystemExit("BOT_TOKEN kiritilmagan!")
     init_db()
-    threading.Thread(target=run_flask, daemon=True).start()
-    if WEBAPP_URL:
-        log.info("Web App URL: %s", WEBAPP_URL)
-    else:
-        log.warning("WEBAPP_URL topilmadi — Do'kon tugmasi ko'rinmaydi. "
-                    "Agar Render/Replit'dan boshqa joyda ishlatsangiz, "
-                    "WEBAPP_URL environment variable'ni qo'lda qo'shing.")
+    try: auto_restore()
+    except Exception as e: log.warning("auto_restore: %s", e)
+    threading.Thread(target=backup_loop, daemon=True).start()
+    threading.Thread(target=lambda: web.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True), daemon=True).start()
+    if BASE_URL: threading.Thread(target=keepalive, daemon=True).start()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_doc))
+    app.add_handler(CallbackQueryHandler(cb_chk, pattern="^chk$"))
+    app.add_handler(CallbackQueryHandler(adm_cb, pattern="^a:"))
+    app.add_handler(CallbackQueryHandler(cb_decide, pattern="^[to]:"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_msg))
+    log.info("Syrexa ishga tushdi. Admins: %s", all_admins())
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    app.run_polling(drop_pending_updates=True)
 
-    # Python 3.13+ da asyncio.get_event_loop() asosiy oqimda ham avtomatik
-    # event loop yaratmay qo'ydi — buni qo'lda ochib beramiz, shunda PTB
-    # (python-telegram-bot) qaysi Python versiyasida ham ishlayveradi.
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+# ============================ MINI APP (frontend) ============================
+INDEX = r"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>__BOT__</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:#eef0f7;--card:#fff;--tx:#151a30;--mut:#8a8fa8;--p:#7c5cff;--p2:#a78bfa;--bd:#e3e6f2;--ok:#16a34a;--er:#e11d48}
+body.dk{--bg:#0a0c18;--card:#151932;--tx:#f1f2fb;--mut:#8b90ab;--bd:#242949}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:-apple-system,"Segoe UI",Roboto,sans-serif;font-size:15px}
+#app{padding:14px 14px 100px;max-width:520px;margin:auto}
+.row{display:flex;align-items:center;gap:10px}.sp{flex:1}.mut{color:var(--mut)}.sm{font-size:12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:18px;padding:14px;margin-bottom:12px}
+.btn{border:0;border-radius:14px;padding:13px 18px;font-weight:700;font-size:15px;color:#fff;background:linear-gradient(135deg,var(--p),var(--p2));width:100%;cursor:pointer}
+.btn.sm{width:auto;padding:10px 16px;font-size:13px}.btn.g{background:linear-gradient(135deg,#16a34a,#22c55e)}.btn.o{background:var(--card);color:var(--tx);border:1px solid var(--bd)}
+.btn:disabled{opacity:.5}
+.ib{width:38px;height:38px;border-radius:12px;background:var(--card);border:1px solid var(--bd);display:flex;align-items:center;justify-content:center;font-weight:700;cursor:pointer;font-size:13px}
+.av{width:44px;height:44px;border-radius:50%;background:linear-gradient(135deg,var(--p),var(--p2));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:18px}
+.bal{display:flex;align-items:center;gap:12px}.bal b{font-size:26px}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px 8px}
+.gc{text-align:center;font-size:11px;cursor:pointer}.gi{aspect-ratio:1;border-radius:16px;overflow:hidden;background:var(--card);border:1px solid var(--bd);margin-bottom:5px}
+.gi img{width:100%;height:100%;object-fit:cover}.ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:800;color:#fff;background:linear-gradient(135deg,var(--p),var(--p2))}
+.ban{display:flex;gap:10px;overflow-x:auto;scroll-snap-type:x mandatory;margin-bottom:12px;border-radius:18px}
+.ban>*{flex:0 0 100%;scroll-snap-align:center;border-radius:18px;overflow:hidden;aspect-ratio:2.1;background:linear-gradient(135deg,#1b1147,#6d3df0)}
+.ban img{width:100%;height:100%;object-fit:cover;display:block}
+.hero{display:flex;align-items:center;justify-content:center;color:#fff;font-size:30px;font-weight:900;letter-spacing:2px}
+h3{margin:6px 2px 10px;font-size:17px}.hd{display:flex;justify-content:space-between;align-items:center}.hd a{color:var(--p);font-weight:700;font-size:13px}
+.seg{display:flex;background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:4px;margin-bottom:12px}
+.seg div{flex:1;text-align:center;padding:10px;border-radius:11px;font-weight:700;font-size:13px;cursor:pointer;color:var(--mut)}.seg .on{background:linear-gradient(135deg,var(--p),var(--p2));color:#fff}
+input{width:100%;padding:14px;border-radius:14px;border:1.5px solid var(--bd);background:var(--card);color:var(--tx);font-size:16px;outline:none}input:focus{border-color:var(--p)}
+.chips{display:flex;gap:8px;margin:10px 0}.chips div{flex:1;text-align:center;padding:10px 0;border-radius:12px;border:1px solid var(--bd);background:var(--card);font-weight:700;font-size:13px;cursor:pointer}.chips .on{border-color:var(--p);color:var(--p)}
+.nav{position:fixed;left:50%;transform:translateX(-50%);bottom:12px;width:calc(100% - 24px);max-width:496px;background:var(--card);border:1px solid var(--bd);border-radius:26px;display:flex;padding:6px;box-shadow:0 8px 30px rgba(0,0,0,.18)}
+.nav div{flex:1;text-align:center;padding:8px 0;border-radius:20px;font-size:10px;color:var(--mut);cursor:pointer}.nav i{display:block;font-style:normal;font-size:19px}.nav .on{background:linear-gradient(135deg,var(--p),var(--p2));color:#fff}
+.prod{display:flex;justify-content:space-between;align-items:center;padding:14px;border-radius:14px;border:1.5px solid var(--bd);background:var(--card);margin-bottom:8px;cursor:pointer;font-weight:600}.prod.on{border-color:var(--p);background:rgba(124,92,255,.1)}
+.tag{font-size:11px;padding:3px 9px;border-radius:20px;font-weight:700}.pending,.new{background:#fff3cd;color:#a16207}.done,.approved{background:#dcfce7;color:#15803d}.canceled,.rejected{background:#ffe4e6;color:#be123c}
+.cn{background:linear-gradient(135deg,#10132a,#2a2170);color:#fff;border-radius:18px;padding:16px;margin-bottom:12px}.cn .n{font-size:21px;font-weight:800;letter-spacing:1px;margin:8px 0}
+.warn{background:rgba(225,29,72,.08);border:1px solid rgba(225,29,72,.3);border-radius:14px;padding:12px;font-size:13px;margin-bottom:12px}
+.tm{font-weight:800;color:var(--p)}.bar{height:5px;border-radius:5px;background:var(--bd);overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--p),var(--p2))}
+#toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#151a30;color:#fff;padding:11px 18px;border-radius:14px;font-size:14px;z-index:9;display:none;max-width:90%}
+.empty{text-align:center;padding:50px 10px;color:var(--mut)}
+.gv{--bg:#0a0c18;--card:#151932;--tx:#f1f2fb;--mut:#8b90ab;--bd:#242949;background:#0a0c18;color:var(--tx);margin:-14px -14px 0;padding-bottom:100px;min-height:100vh}
+.hero2{height:200px;background:linear-gradient(135deg,#1b1147,#6d3df0);background-size:cover;background-position:center;position:relative;display:flex;align-items:flex-end;padding:16px}
+.hero2 .hs{position:absolute;inset:0;background:linear-gradient(transparent 35%,#0a0c18)}.hero2 h2{position:relative;margin:0;font-size:24px;font-weight:800}
+.info{display:flex;justify-content:space-between;align-items:center;margin:12px 14px;padding:13px 14px;border-radius:14px;background:var(--card);border:1px solid var(--bd);font-weight:700;font-size:14px}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;padding:4px 14px 0}.tabs span{padding:8px 14px;border-radius:20px;background:var(--card);border:1px solid var(--bd);font-size:12px;font-weight:700;cursor:pointer}
+.tabs .on{background:linear-gradient(135deg,var(--p),var(--p2));border-color:transparent;color:#fff}.gt{margin:16px 14px 10px;font-weight:700}
+.pg{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:0 14px}.pc{display:flex;align-items:center;gap:10px;padding:12px;border-radius:14px;background:var(--card);border:1px solid var(--bd);cursor:pointer;min-height:64px}
+.pc img,.pi{width:44px;height:44px;border-radius:10px;object-fit:cover;flex:none}.pi{background:linear-gradient(135deg,var(--p),var(--p2));display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff}
+.pt{display:flex;flex-direction:column;gap:3px;font-size:12px;min-width:0}.pt b{font-size:13px}.pt span{font-weight:800}.pt small{color:var(--mut);font-weight:400}.pt em{font-style:normal;background:#f59e0b;color:#fff;border-radius:6px;padding:1px 6px;font-size:10px}
+.ov{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:8;display:flex;align-items:flex-end;justify-content:center}
+.sh{width:100%;max-width:520px;background:#12152b;color:#f1f2fb;border-radius:24px 24px 0 0;padding:22px 16px 26px;text-align:center;--card:#1a1e3a;--bd:#2a2f52;--tx:#f1f2fb;--mut:#8b90ab}
+.sh .ic{font-size:34px;width:64px;height:64px;border-radius:18px;background:rgba(225,29,72,.15);margin:0 auto 10px;display:flex;align-items:center;justify-content:center}
+.tbl{background:#1a1e3a;border:1px solid #2a2f52;border-radius:14px;margin:14px 0;text-align:left}.tbl div{display:flex;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #2a2f52;font-size:13px}.tbl div:last-child{border:0}.tbl .er{color:#fb7185}
+.tl{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0}.tile{position:relative;background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:16px 12px;font-weight:700;font-size:13px;cursor:pointer}.tile i{display:block;font-style:normal;font-size:26px;margin-bottom:6px}.bd{position:absolute;top:8px;right:8px;background:var(--er);color:#fff;border-radius:10px;font-size:11px;padding:1px 7px}
+.fm{width:calc(100% - 24px);max-width:480px;max-height:88vh;overflow:auto;background:var(--card);color:var(--tx);border-radius:20px;padding:16px}.fl{font-size:12px;color:var(--mut);margin:12px 0 5px;font-weight:600}
+textarea,select{width:100%;padding:12px;border-radius:14px;border:1.5px solid var(--bd);background:var(--card);color:var(--tx);font-size:15px;font-family:inherit}textarea{min-height:90px}
+.ip{display:flex;align-items:center;gap:12px}.ip img,.ip span{width:84px;height:62px;border-radius:12px;object-fit:cover;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:24px;flex:none}
+.li{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:10px;margin-bottom:8px;cursor:pointer}.li img,.li .pi{width:44px;height:44px;border-radius:10px;object-fit:cover;flex:none}.li .sp{min-width:0}
+.hero2 .ed{position:absolute;top:12px;right:12px;background:rgba(0,0,0,.55);border-radius:10px;padding:6px 10px;font-size:13px;color:#fff}
+</style></head><body><div id="toast"></div><div id="app"></div><div id="modal"></div>
+<script>
+const tg=window.Telegram.WebApp;tg.ready();tg.expand();
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money=n=>Number(n).toLocaleString('ru-RU').replace(/\u00a0/g,' ');
+const S={lang:localStorage.lang||'uz',dark:localStorage.dark==='1',tab:'home',d:null,amt:50000,seg:'game',oseg:'o',q:'',player:'',pid:null};
+const T={uz:{hi:'Salom',bal:'BALANS',top:'To\'ldirish',promo:'Promokodlar',sup:'Yordam',pop:'Mashhur o\'yinlar',all:'Barchasi',home:'Asosiy',games:'O\'yinlar',orders:'Buyurtmalar',prof:'Profil',tx:'Tranzaksiyalar',search:'O\'yin yoki xizmatni qidiring',
+amount:'Summani kiriting',min:'Minimum',steps:'To\'ldirish qadamlari',s1:'To\'lov summasini tanlang',s2:'Ko\'rsatilgan kartaga AYNAN shu summani o\'tkazing',s3:'"Men to\'ladim" tugmasini bosing',s4:'Admin tasdiqlagach balansingiz to\'ldiriladi',
+exact:'Aynan shu summani o\'tkazing',one:'Faqat BITTA o\'tkazma',onet:'Summani bo\'lmang va yaxlitlamang.',valid:'Karta amal qilish vaqti',card:'Karta raqami',copy:'Nusxalash',copied:'Nusxalandi',paid:'Men to\'ladim',rules:'To\'lov qoidalari',r1:'Summani 1 so\'mga ham o\'zgartirmang',r2:'Vaqt ichida to\'lang',r3:'Boshqa summa yubormang',r4:'Summani ikkiga bo\'lmang',
+buy:'Sotib olish',pid_:'ID kiriting',pick:'Mahsulotni tanlang',noprod:'Mahsulotlar hali qo\'shilmagan',noord:'Buyurtmalar yo\'q',notx:'Tranzaksiyalar yo\'q',nobal:'Balans yetarli emas',ok:'Muvaffaqiyatli!',
+pending:'Kutilmoqda',done:'Bajarildi',canceled:'Bekor',approved:'Tasdiqlandi',rejected:'Rad etildi',new:'Yangi',pr_in:'PROMOKOD',act:'Faollashtirish',lang:'Til',sub:'Botdan foydalanish uchun kanalga obuna bo\'ling',chk:'Tekshirish',nocard:'Hozircha to\'lov usuli mavjud emas',err:'Xatolik',bad:'Kod topilmadi yoki ishlatilgan',added:'Qo\'shildi',expired:'Vaqt tugadi',maint:'Texnik ishlar',confirm:'Tasdiqlaysizmi?',adm:'Admin panel uchun botda /admin yozing',bonus:'Balans to\'ldirildi'},
+ru:{hi:'Привет',bal:'БАЛАНС',top:'Пополнить',promo:'Промокоды',sup:'Поддержка',pop:'Популярные игры',all:'Все',home:'Главная',games:'Игры',orders:'Заказы',prof:'Профиль',tx:'Транзакции',search:'Поиск игры или услуги',
+amount:'Введите сумму',min:'Минимум',steps:'Шаги пополнения',s1:'Выберите сумму',s2:'Переведите на указанную карту ТОЧНО эту сумму',s3:'Нажмите «Я оплатил»',s4:'После подтверждения баланс пополнится',
+exact:'Переведите ровно',one:'Только ОДИН перевод',onet:'Не разбивайте и не округляйте сумму.',valid:'Карта действует',card:'Номер карты',copy:'Копировать',copied:'Скопировано',paid:'Я оплатил',rules:'Правила оплаты',r1:'Не меняйте сумму даже на 1 сум',r2:'Оплатите в течение времени',r3:'Не отправляйте другую сумму',r4:'Не разбивайте сумму на два перевода',
+buy:'Купить',pid_:'Введите ID',pick:'Выберите товар',noprod:'Товары ещё не добавлены',noord:'Нет заказов',notx:'Нет транзакций',nobal:'Недостаточно средств',ok:'Успешно!',
+pending:'Ожидание',done:'Выполнен',canceled:'Отменён',approved:'Подтверждён',rejected:'Отклонён',new:'Новый',pr_in:'ПРОМОКОД',act:'Активировать',lang:'Язык',sub:'Подпишитесь на канал, чтобы пользоваться ботом',chk:'Проверить',nocard:'Способ оплаты пока недоступен',err:'Ошибка',bad:'Код не найден или использован',added:'Добавлено',expired:'Время истекло',maint:'Технические работы',confirm:'Подтвердить?',adm:'Для админ-панели напишите боту /admin',bonus:'Баланс пополнен'}};
+Object.assign(T.uz,{nobal2:'Bu xarid uchun balansda mablag\' yetarli emas. Avval balansni to\'ldiring.',price:'Mahsulot narxi',short:'Yetmaydi',close:'Yopish',topbal:'Balansni to\'ldirish'});
+Object.assign(T.ru,{nobal2:'На балансе недостаточно средств для этой покупки. Сначала пополните баланс.',price:'Цена товара',short:'Не хватает',close:'Закрыть',topbal:'Пополнение баланса'});
+const t=k=>(T[S.lang]||T.uz)[k]||k;
+function toast(m){const e=$('#toast');e.textContent=m;e.style.display='block';clearTimeout(S.tt);S.tt=setTimeout(()=>e.style.display='none',2600)}
+async function api(p,body){const r=await fetch(p,{method:body!==undefined?'POST':'GET',headers:{'Content-Type':'application/json','X-Init':tg.initData},body:body!==undefined?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw j;return j}
+function ask(m,cb){tg.showConfirm?tg.showConfirm(m,ok=>ok&&cb()):(confirm(m)&&cb())}
+function gimg(g,cls){return g.img?`<img src="/img/${g.img}" loading="lazy">`:`<div class="ph">${esc(g.name[0])}</div>`}
+function gcard(g){return `<div class="gc" onclick="openGame(${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}</div>`}
+function go(tab,arg){S.tab=tab;S.arg=arg;clearInterval(S.tm);if(tab!='game')S.g=null;S.sheet=false;document.body.style.background=tab=='game'?'#0a0c18':'';
+ const back=(tab=='game'||tab=='pay');back?tg.BackButton.show():tg.BackButton.hide();render();window.scrollTo(0,0)}
+tg.BackButton.onClick(()=>back());
+function head(){const u=S.d.user;return `<div class="row" style="margin-bottom:12px"><div class="av">${esc((u.name||'?')[0])}</div><div><div class="mut sm">${t('hi')} 👋</div><b>${esc(u.name)}</b></div><div class="sp"></div>${S.d.user.admin?`<div class="ib" onclick="admGo('adm')">🛠</div>`:''}<div class="ib" onclick="setLang()">${S.lang.toUpperCase()}</div><div class="ib" onclick="setDark()">${S.dark?'☀️':'🌙'}</div></div>`}
+function balCard(){return `<div class="card bal"><div style="font-size:26px">💳</div><div class="sp"><div class="mut sm">${t('bal')}</div><b>${money(S.d.user.balance)}</b> <span class="mut sm">so'm</span></div><button class="btn sm" onclick="go('topup')">+ ${t('top')}</button></div>`}
+function nav(){const a=[['home','🏠',t('home')],['games','🎮',t('games')],['topup','👛',t('top')],['orders','🕘',t('orders')],['prof','👤',t('prof')]];
+ return `<div class="nav">${a.map(x=>`<div class="${S.tab==x[0]?'on':''}" onclick="go('${x[0]}')"><i>${x[1]}</i>${x[2]}</div>`).join('')}</div>`}
+function render(){const A=$('#app');const d=S.d;if(!d)return;if(S.tab.startsWith('adm')){A.innerHTML=vAdm();return}
+ if(d.sub&&d.sub.length){A.innerHTML=`<div class="card" style="margin-top:40px;text-align:center"><div style="font-size:42px">📢</div><p>${t('sub')}</p>${d.sub.map(c=>`<button class="btn o" style="margin-bottom:8px" onclick="tg.openTelegramLink('${esc(c.link)}')">${esc(c.title)}</button>`).join('')}<button class="btn" onclick="boot()">${t('chk')}</button></div>`;return}
+ let h='';const m=S.tab;
+ if(m=='home')h=vHome();else if(m=='games')h=vGames();else if(m=='game')h=vGame();else if(m=='topup')h=vTopup();else if(m=='pay')h=vPay();else if(m=='orders')h=vOrders();else h=vProf();
+ A.innerHTML=h+((m=='game'||m=='pay')?'':nav())+((m=='game'&&S.sheet&&S.sel)?sheet():'');
+ if(m=='pay')tick();}
+function vHome(){const d=S.d;
+ const bn=d.banners.length?d.banners.map(b=>`<div onclick="${b.link?`tg.openLink('${esc(b.link)}')`:''}"><img src="/img/${b.img}"></div>`).join(''):`<div class="hero">${esc(d.cfg.bot)}</div>`;
+ return head()+balCard()+`<div class="row" style="margin-bottom:12px"><button class="btn o" onclick="go('prof')">🎟 ${t('promo')}</button><button class="btn o" onclick="sup()">🎧 ${t('sup')}</button></div><div class="ban">${bn}</div>
+ <div class="hd"><h3>${t('pop')}</h3><a onclick="go('games')">${t('all')}</a></div><div class="grid">${d.games.filter(g=>g.cat=='game').slice(0,8).map(gcard).join('')}</div>`}
+function sup(){const l=S.d.cfg.support;l?tg.openTelegramLink(l):toast(t('sup'))}
+function vGames(){const L=S.d.games.filter(g=>g.cat==S.seg&&g.name.toLowerCase().includes(S.q.toLowerCase()));
+ return `<h3>${t('games')}</h3><input id="sq" placeholder="🔍 ${t('search')}" value="${esc(S.q)}" oninput="S.q=this.value;gridUpd()" style="margin-bottom:12px"><div class="seg"><div class="${S.seg=='game'?'on':''}" onclick="S.seg='game';render()">${t('games')}</div><div class="${S.seg=='promo'?'on':''}" onclick="S.seg='promo';render()">${t('promo')}</div></div><div class="grid" id="gg">${L.map(gcard).join('')}</div>`}
+function gridUpd(){const L=S.d.games.filter(g=>g.cat==S.seg&&g.name.toLowerCase().includes(S.q.toLowerCase()));$('#gg').innerHTML=L.map(gcard).join('')}
+async function openGame(id){S.g=null;S.sel=null;S.grp=null;go('game',id);try{S.g=await api('/api/game/'+id);render()}catch(e){toast(t('err'));go('games')}}
+function infoRow(i){return `<div class="info" onclick="${i.link?`tg.openLink('${esc(i.link)}')`:''}"><span>${esc(i.text)}</span><em style="font-style:normal">›</em></div>`}
+function vGame(){const g=S.g;if(!g)return `<div class="empty">⏳</div>`;
+ const grps=[...new Set(g.products.map(p=>p.grp||''))];if(S.grp==null||!grps.includes(S.grp))S.grp=grps[0]||'';
+ const L=g.products.filter(p=>(p.grp||'')==S.grp),hi=g.hero||g.img;
+ return `<div class="gv"><div class="hero2" style="${hi?`background-image:url(/img/${hi})`:''}"><div class="hs"></div><h2>${esc(g.name)}</h2></div>${g.info?infoRow(g.info):''}
+ ${(grps.length>1||grps[0])?`<div class="tabs">${grps.map(x=>`<span class="${x==S.grp?'on':''}" data-g="${esc(x)}" onclick="S.grp=this.dataset.g;render()">${esc(x)}</span>`).join('')}</div>`:''}
+ <div class="gt">${t('pick')}</div><div class="pg">${L.length?L.map(p=>`<div class="pc" onclick="selP(${p.id})">${p.img?`<img src="/img/${p.img}" loading="lazy">`:`<div class="pi">${esc(g.name[0])}</div>`}<div class="pt"><b>${esc(p.name)}${p.badge?` <em>${esc(p.badge)}</em>`:''}</b><span>${money(p.price)} <small>so'm</small></span></div></div>`).join(''):`<div class="empty" style="grid-column:1/3">${t('noprod')}</div>`}</div></div>`}
+function selP(id){S.sel=S.g.products.find(x=>x.id==id);S.sheet=true;render()}
+function closeSheet(){S.sheet=false;render()}
+function sheet(){const p=S.sel,bal=S.d.user.balance,sh=p.price-bal;
+ return `<div class="ov" onclick="closeSheet()"><div class="sh" onclick="event.stopPropagation()">`+(sh>0?
+ `<div class="ic">👛</div><h3 style="margin:0">${t('nobal')}</h3><p class="mut sm">${t('nobal2')}</p><div class="tbl"><div><span class="mut">${t('price')}</span><b>${money(p.price)} so'm</b></div><div><span class="mut">${t('bal')}</span><b>${money(bal)} so'm</b></div><div class="er"><span>${t('short')}</span><b>${money(sh)} so'm</b></div></div><div class="row"><button class="btn o" onclick="closeSheet()">${t('close')}</button><button class="btn" onclick="S.sheet=false;go('topup')">+ ${t('topbal')}</button></div>`
+ :`<h3 style="margin:0 0 4px">${esc(S.g.name)}</h3><div class="mut sm">${esc(p.name)}</div><input id="pl" placeholder="${esc(S.g.field)}" value="${esc(S.player)}" oninput="S.player=this.value" style="margin:14px 0 0"><div class="tbl"><div><span class="mut">${t('price')}</span><b>${money(p.price)} so'm</b></div><div><span class="mut">${t('bal')}</span><b>${money(bal)} so'm</b></div></div><div class="row"><button class="btn o" onclick="closeSheet()">${t('close')}</button><button class="btn" onclick="buy()">${t('buy')}</button></div>`)+`</div></div>`}
+async function buy(){const g=S.g,p=S.sel;if(!p)return;if((S.player||'').trim().length<2)return toast(t('pid_'));
+ ask(`${g.name} — ${p.name}\n${money(p.price)} so'm\n${g.field}: ${S.player}`,async()=>{try{const r=await api('/api/order',{product_id:p.id,player:S.player.trim()});S.d.user.balance=r.balance;S.sheet=false;toast('✅ '+t('ok'));S.oseg='o';go('orders')}catch(e){if(e.err=='balance'){toast(t('nobal'));render()}else toast(t('err'))}})}
+function vTopup(){const A=[10000,50000,100000,200000,500000];
+ return `<h3>${t('top')}</h3>`+balCard().replace(/<button.*<\/button>/,'')+`<div class="card"><div class="mut sm">${t('amount')}</div><input id="am" inputmode="numeric" value="${money(S.amt)}" oninput="S.amt=+this.value.replace(/\\D/g,'')||0"><div class="chips">${[50000,100000,200000,500000].map(a=>`<div class="${S.amt==a?'on':''}" onclick="S.amt=${a};render()">${a/1000}k</div>`).join('')}</div><div class="mut sm">${t('min')}: ${money(S.d.cfg.min)}</div></div>
+ <div class="card"><b>${t('steps')}</b>${[1,2,3,4].map(i=>`<div class="row" style="margin-top:10px"><div class="ib" style="width:26px;height:26px;border-radius:50%;font-size:12px">${i}</div><div class="sm">${t('s'+i)}</div></div>`).join('')}</div><button class="btn" onclick="mkTop()">${t('top')}</button>`}
+async function mkTop(){if(S.amt<S.d.cfg.min)return toast(t('min')+': '+money(S.d.cfg.min));try{S.pay=await api('/api/topup',{amount:S.amt});S.pay.t0=Date.now();go('pay')}catch(e){toast(e.err=='nocard'?t('nocard'):t('err'))}}
+function vPay(){const p=S.pay;return `<h3>${t('top')}</h3><div class="card" style="text-align:center;background:rgba(124,92,255,.1)"><div class="mut sm">${t('exact')}</div><div style="font-size:30px;font-weight:900;margin:6px 0" onclick="cp('${p.amount}')">${money(p.amount)} so'm ⧉</div></div>
+ <div class="warn"><b>⚠️ ${t('one')}</b><br>${t('onet')}</div>
+ <div class="card"><div class="row"><span class="mut sm">${t('valid')}</span><div class="sp"></div><span class="tm" id="tm"></span></div><div class="bar"><i id="br" style="width:100%"></i></div></div>
+ <div class="cn"><div class="sm" style="opacity:.7">${t('card')} · ${esc(p.card.bank)}</div><div class="n" onclick="cp('${p.card.number.replace(/\\s/g,'')}')">${esc(p.card.number)}</div><div class="sm">${esc(p.card.holder)}</div><button class="btn o" style="margin-top:12px;background:rgba(255,255,255,.12);color:#fff;border:0" onclick="cp('${p.card.number.replace(/\\s/g,'')}')">⧉ ${t('copy')}</button></div>
+ <div class="card"><b>📋 ${t('rules')}</b>${['✅ r1','✅ r2','❌ r3','❌ r4'].map(x=>{const a=x.split(' ');return `<div class="sm" style="margin-top:8px">${a[0]} ${t(a[1])}</div>`}).join('')}</div><button class="btn g" onclick="paid()">${t('paid')}</button>`}
+function tick(){const p=S.pay;const f=()=>{const left=Math.max(0,p.ttl-Math.floor((Date.now()-p.t0)/1000));const e=$('#tm');if(!e)return clearInterval(S.tm);e.textContent=left?`${Math.floor(left/60)}:${String(left%60).padStart(2,'0')}`:t('expired');$('#br').style.width=(left/p.ttl*100)+'%'};f();S.tm=setInterval(f,1000)}
+function cp(x){(navigator.clipboard?navigator.clipboard.writeText(x):Promise.reject()).catch(()=>{const a=document.createElement('textarea');a.value=x;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()});toast('✅ '+t('copied'));tg.HapticFeedback&&tg.HapticFeedback.impactOccurred('light')}
+async function paid(){try{await api('/api/topup/'+S.pay.id+'/paid',{});toast('✅ '+t('ok'));S.oseg='t';go('orders')}catch(e){toast(t('err'))}}
+function vOrders(){setTimeout(loadH,0);const H=S.h;
+ let body=!H?`<div class="empty">⏳</div>`:S.oseg=='o'?(H.orders.length?H.orders.map(o=>`<div class="card row"><div class="sp"><b>${esc(o.game)}</b><div class="mut sm">${esc(o.product)} · #${o.id}</div><div class="mut sm">${ts(o.created)}</div></div><div style="text-align:right"><b>${money(o.price)}</b><div><span class="tag ${o.status}">${t(o.status)}</span></div></div></div>`).join(''):`<div class="empty">🕘<br>${t('noord')}</div>`)
+ :(H.tx.length?H.tx.map(o=>`<div class="card row"><div class="sp"><b>${t('top')}</b><div class="mut sm">#${o.id} · ${ts(o.created)}</div></div><div style="text-align:right"><b>+${money(o.amount)}</b><div><span class="tag ${o.status}">${t(o.status)}</span></div></div></div>`).join(''):`<div class="empty">💳<br>${t('notx')}</div>`);
+ return `<h3>${t('orders')}</h3><div class="seg"><div class="${S.oseg=='o'?'on':''}" onclick="S.oseg='o';render()">${t('orders')}</div><div class="${S.oseg=='t'?'on':''}" onclick="S.oseg='t';render()">${t('tx')}</div></div>`+body}
+function ts(x){const d=new Date((x+18000)*1000);const p=n=>String(n).padStart(2,'0');return `${p(d.getUTCDate())}.${p(d.getUTCMonth()+1)} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`}
+async function loadH(){if(S.hl)return;S.hl=1;try{S.h=await api('/api/history');const u=await api('/api/init');S.d.user=u.user;S.hl=0;if(S.tab=='orders')render()}catch(e){S.hl=0}}
+function vProf(){const u=S.d.user;return `<div class="card" style="text-align:center"><div class="av" style="margin:auto;width:70px;height:70px;font-size:30px">${esc((u.name||'?')[0])}</div><h3 style="margin:10px 0 2px">${esc(u.name)}</h3><div class="mut sm">${u.username?'@'+esc(u.username)+' · ':''}ID: ${u.id}</div></div>`+balCard()+
+ `<div class="card"><b>🎟 ${t('promo')}</b><input id="pc" placeholder="${t('pr_in')}" style="margin:10px 0;text-transform:uppercase"><button class="btn" onclick="actPromo()">${t('act')}</button></div>
+ <div class="card"><b>🌐 ${t('lang')}</b><div class="seg" style="margin:10px 0 0"><div class="${S.lang=='uz'?'on':''}" onclick="setLang('uz')">O'zbekcha</div><div class="${S.lang=='ru'?'on':''}" onclick="setLang('ru')">Русский</div></div></div>${u.admin?`<button class="btn" onclick="admGo('adm')">🛠 Admin panel</button>`:''}`}
+async function actPromo(){const c=$('#pc').value.trim();if(!c)return;try{const r=await api('/api/promo',{code:c});S.d.user.balance=r.balance;toast('✅ +'+money(r.amount));render()}catch(e){toast(t('bad'))}}
+function setLang(l){S.lang=l||(S.lang=='uz'?'ru':'uz');localStorage.lang=S.lang;S.d.user.lang=S.lang;api('/api/lang',{lang:S.lang}).catch(()=>{});render()}
+function setDark(){S.dark=!S.dark;localStorage.dark=S.dark?'1':'0';document.body.classList.toggle('dk',S.dark);render()}
+async function boot(){try{S.d=await api('/api/init');if(!localStorage.lang)S.lang=S.d.user.lang||'uz';document.body.classList.toggle('dk',S.dark||(!localStorage.dark&&tg.colorScheme=='dark'));if(new URLSearchParams(location.search).get('admin')&&S.d.user.admin)admGo('adm');else render()}
+ catch(e){$('#app').innerHTML=`<div class="empty" style="margin-top:80px">${e.err=='maintenance'?'🛠 '+t('maint'):e.err=='banned'?'🚫':'Telegram ichida oching'}</div>`}}
+/* ===== ADMIN PANEL ===== */
+let F=null;
+const aj=(p,b)=>api('/api/a/'+p,b||{});
+function back(){const m=S.tab;if(m.startsWith('adm')){if(m=='adm')go('prof');else if(m=='adm_game')admGo('adm_games');else admGo('adm')}else go(m=='pay'?'topup':'games')}
+async function admGo(tab,arg){S.tab=tab;S.arg=arg;S.a=null;tg.BackButton.show();clearInterval(S.tm);document.body.style.background='';render();window.scrollTo(0,0);
+ try{S.a=await api('/api/a/data/'+(tab.slice(4)||'home')+'?id='+(arg||'')+'&q='+encodeURIComponent(S.aq||''))}catch(e){toast((e&&e.err)||t('err'))}
+ if(S.tab==tab)render()}
+const ah=(h,b)=>`<div class="hd"><h3>${h}</h3>${b||''}</div>`;
+const GF=[['name','Nomi','text'],['cat','Bo\'lim','sel',[['game','O\'yinlar'],['promo','Promokodlar bo\'limi']]],['img','Kichik ikonka (ro\'yxatdagi rasm)','img'],['hero','Katta banner (o\'yin sahifasi tepasi)','img'],['picon','Mahsulotlar uchun umumiy ikonka (UC, Diamonds rasmi)','img'],['field','Foydalanuvchi kiritadigan maydon (Player ID)','text'],['info','Info qator: matn | havola (ixtiyoriy)','text'],['active','Ko\'rinsinmi','tog']];
+const PF=[['name','Nomi (masalan 60 UC)','text'],['price','Narxi (so\'m)','number'],['grp','Guruh / tab (UC, Prime, Diamonds, RU...)','text'],['badge','Belgi (2x, HIT...)','text'],['img','Rasm (bo\'sh bo\'lsa umumiy ikonka)','img'],['active','Ko\'rinsinmi','tog']];
+const CF=[['number','Karta raqami','text'],['holder','Karta egasi ismi','text'],['bank','Bank (UZCARD, HUMO)','text'],['active','Faol','tog']];
+const BF=[['img','Banner rasmi','img'],['link','Bosilganda ochiladigan havola (ixtiyoriy)','text']];
+const SF=[['bot_name','Bot nomi','text'],['welcome_uz','Salomlashuv matni (UZ) — {name} = ism','area'],['welcome_ru','Salomlashuv matni (RU)','area'],['welcome_img','Salomlashuv rasmi','img'],['support_link','Yordam havolasi (https://t.me/...)','text'],['channel_link','Kanal havolasi','text'],['min_topup','Minimal to\'ldirish (so\'m)','number'],['card_ttl','Karta amal qilish vaqti (daqiqa)','number'],['maintenance','Texnik ishlar rejimi','tog']];
+function vAdm(){const a=S.a;if(!a)return '<div class="empty">⏳</div>';
+ return ({adm:aHome,adm_games:aGames,adm_game:aGame,adm_banners:aBanners,adm_cards:aCards,adm_users:aUsers,adm_tops:aTops,adm_ords:aOrds,adm_promos:aPromos,adm_chs:aChs,adm_set:aSet,adm_adms:aAdms,adm_bc:aBc}[S.tab]||aHome)(a)}
+function aHome(a){const c=(i,v,l)=>`<div class="card" style="margin:0"><div style="font-size:20px">${i}</div><b style="font-size:18px">${v}</b><div class="mut sm">${l}</div></div>`;
+ const M=[['games','🎮','O\'yinlar va narxlar'],['banners','🖼','Bannerlar'],['tops','💰','To\'ldirishlar',a.p_top],['ords','📦','Buyurtmalar',a.p_ord],['users','👥','Foydalanuvchilar'],['cards','💳','Kartalar'],['promos','🎟','Promokodlar'],['chs','📢','Majburiy obuna'],['bc','📨','Xabar yuborish'],['set','⚙️','Sozlamalar'],['adms','👮','Adminlar']];
+ return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div><div class="tl">${M.map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
+function aGames(a){return ah('🎮 O\'yinlar',`<button class="btn sm" onclick="newGame()">+ O'yin</button>`)+`<div class="mut sm" style="margin-bottom:12px">O'yinni bosing → rasm, nom va narxlarni o'zgartiring</div><div class="grid">${a.games.map(g=>`<div class="gc" onclick="admGo('adm_game',${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}<div class="mut" style="font-size:10px">${g.pc} ta${g.active?'':' · 🔴'}</div></div>`).join('')}</div>`}
+function aGame(a){const g=a.game;if(!g)return '<div class="empty">—</div>';const hi=g.hero||g.img;
+ return ah(esc(g.name),`<button class="btn sm" onclick="editGame()">✏️ Tahrirlash</button>`)+`<div class="hero2" style="border-radius:18px;margin-bottom:12px;${hi?`background-image:url(/img/${hi})`:''}" onclick="editGame()"><div class="hs"></div><h2>${esc(g.name)}</h2><span class="ed">🖼 Rasmni o'zgartirish</span></div>
+ <div class="hd"><b>Mahsulotlar (${a.products.length})</b><span><button class="btn sm" onclick="newProd()">+ Mahsulot</button> <button class="btn o sm" onclick="bulkProd()">📥</button></span></div>`+
+ (a.products.map(p=>`<div class="li" onclick="editProd(${p.id})">${(p.img||g.picon)?`<img src="/img/${p.img||g.picon}">`:`<div class="pi">${esc(g.name[0])}</div>`}<div class="sp"><b>${esc(p.name)}</b>${p.badge?` <span class="tag pending">${esc(p.badge)}</span>`:''}<div class="mut sm">${esc(p.grp||'—')}${p.active?'':' · 🔴 yashirin'}</div></div><b>${money(p.price)}</b></div>`).join('')||'<div class="empty">Mahsulot yo\'q. «+ Mahsulot» yoki 📥 ni bosing</div>')}
+function editGame(){const g=S.a.game;openForm('O\'yin',GF,g,async v=>{await aj('save/games',Object.assign({},v,{id:g.id}));await admGo('adm_game',g.id)},{del:()=>delRow('games',g.id,()=>admGo('adm_games'))})}
+function newGame(){openForm('Yangi o\'yin',GF,{cat:'game',field:'Player ID',active:1},async v=>{const r=await aj('save/games',v);await admGo('adm_game',r.id)})}
+function newProd(){const g=S.a.game;openForm('Yangi mahsulot',PF,{active:1},async v=>{await aj('save/products',Object.assign({},v,{game_id:g.id}));await admGo('adm_game',g.id)})}
+function editProd(id){const g=S.a.game,p=S.a.products.find(x=>x.id==id);openForm('Mahsulot',PF,p,async v=>{await aj('save/products',Object.assign({},v,{id:id,game_id:g.id}));await admGo('adm_game',g.id)},{del:()=>delRow('products',id,()=>admGo('adm_game',g.id))})}
+function bulkProd(){const g=S.a.game;openForm('Ommaviy qo\'shish',[['text','Har qatorda: nom | narx | guruh | belgi','area']],{text:'60 UC | 11700 | UC\n325 UC | 59000 | UC'},async v=>{await aj('bulk',{game_id:g.id,text:v.text});await admGo('adm_game',g.id)})}
+function delRow(tb,id,after){ask('O\'chirasizmi?',async()=>{try{await aj('del/'+tb,{id:id});closeForm();after()}catch(e){toast((e&&e.err)||t('err'))}})}
+function aBanners(a){return ah('🖼 Bannerlar',`<button class="btn sm" onclick="editBan()">+ Banner</button>`)+(a.items.map(b=>`<div class="card" onclick="editBan(${b.id})" style="padding:8px"><div class="ban" style="margin:0"><div><img src="/img/${b.img}"></div></div><div class="mut sm" style="margin:6px 4px 0">${esc(b.link||'havolasiz')}</div></div>`).join('')||'<div class="empty">Banner yo\'q</div>')}
+function editBan(id){const b=id?S.a.items.find(x=>x.id==id):{};openForm('Banner',BF,b,async v=>{await aj('save/banners',Object.assign({},v,id?{id:id}:{}));await admGo('adm_banners')},id?{del:()=>delRow('banners',id,()=>admGo('adm_banners'))}:{})}
+function aCards(a){return ah('💳 Kartalar',`<button class="btn sm" onclick="editCard()">+ Karta</button>`)+'<div class="mut sm" style="margin-bottom:10px">Faol kartalardan biri to\'ldirishda tasodifiy beriladi</div>'+(a.items.map(c=>`<div class="li" onclick="editCard(${c.id})"><div class="sp"><b>${esc(c.number)}</b><div class="mut sm">${esc(c.holder)} · ${esc(c.bank)}</div></div>${c.active?'🟢':'🔴'}</div>`).join('')||'<div class="empty">Karta yo\'q! To\'ldirish ishlamaydi</div>')}
+function editCard(id){const c=id?S.a.items.find(x=>x.id==id):{active:1,bank:'UZCARD'};openForm('Karta',CF,c,async v=>{await aj('save/cards',Object.assign({},v,id?{id:id}:{}));await admGo('adm_cards')},id?{del:()=>delRow('cards',id,()=>admGo('adm_cards'))}:{})}
+function aUsers(a){return ah('👥 Foydalanuvchilar')+`<div class="row" style="margin-bottom:12px"><input id="uq" placeholder="ID, ism yoki @username" value="${esc(S.aq||'')}" onkeydown="if(event.key=='Enter')uSearch()"><button class="btn sm" onclick="uSearch()">🔍</button></div>`+a.items.map(u=>`<div class="li" onclick="editUser(${u.id})"><div class="av" style="width:38px;height:38px;font-size:15px">${esc((u.name||'?')[0])}</div><div class="sp"><b>${esc(u.name)}</b>${u.banned?' 🚫':''}<div class="mut sm">${u.username?'@'+esc(u.username)+' · ':''}${u.id}</div></div><b>${money(u.balance)}</b></div>`).join('')}
+function uSearch(){S.aq=$('#uq').value.trim();admGo('adm_users')}
+function editUser(id){const u=S.a.items.find(x=>x.id==id);openForm(u.name+' · '+money(u.balance)+' so\'m',[['amt','Summa (so\'m)','number'],['op','Amal','sel',[['add','➕ Balansga qo\'shish'],['sub','➖ Balansdan ayirish']]],['banned','Bloklangan','tog']],{op:'add',banned:u.banned},async v=>{await aj('user',{id:id,op:v.op,amt:v.amt,banned:v.banned});await admGo('adm_users')})}
+function decide(kind,id,ok){ask(ok?'Tasdiqlaysizmi?':'Rad etasizmi?',async()=>{try{const r=await aj(kind,{id:id,ok:ok});toast(r.msg);admGo(S.tab)}catch(e){toast(t('err'))}})}
+const dbtn=(k,id)=>`<div class="row" style="margin-top:10px"><button class="btn g sm" style="flex:1" onclick="decide('${k}',${id},1)">✅ Tasdiqlash</button><button class="btn o sm" style="flex:1" onclick="decide('${k}',${id},0)">❌ Rad / Bekor</button></div>`;
+function aTops(a){return ah('💰 To\'ldirishlar')+(a.items.map(x=>`<div class="card"><div class="row"><div class="sp"><b>+${money(x.amount)} so'm</b><div class="mut sm">${esc(x.uname||x.uid)} · #${x.id} · ${ts(x.created)}</div></div><span class="tag ${x.status}">${t(x.status)}</span></div>${x.status=='pending'?dbtn('topup',x.id):''}</div>`).join('')||'<div class="empty">Yo\'q</div>')}
+function aOrds(a){return ah('📦 Buyurtmalar')+(a.items.map(x=>`<div class="card"><div class="row"><div class="sp"><b>${esc(x.game)} — ${esc(x.product)}</b><div class="mut sm">ID: <b>${esc(x.player)}</b> · ${esc(x.uname||x.uid)}</div><div class="mut sm">#${x.id} · ${ts(x.created)} · ${money(x.price)} so'm</div></div><span class="tag ${x.status}">${t(x.status)}</span></div>${x.status=='pending'?dbtn('order',x.id):''}</div>`).join('')||'<div class="empty">Yo\'q</div>')}
+function aPromos(a){return ah('🎟 Promokodlar',`<button class="btn sm" onclick="editPromo()">+ Kod</button>`)+'<div class="mut sm" style="margin-bottom:10px">Kodni bossangiz — o\'chiriladi</div>'+(a.items.map(p=>`<div class="li" onclick="delRow('promos','${esc(p.code)}',()=>admGo('adm_promos'))"><div class="sp"><b>${esc(p.code)}</b><div class="mut sm">qolgan: ${p.left}</div></div><b>${money(p.amount)}</b><span>🗑</span></div>`).join('')||'<div class="empty">Yo\'q</div>')}
+function editPromo(){openForm('Promokod',[['code','Kod','text'],['amount','Summa (so\'m)','number'],['left','Necha kishi ishlata oladi','number']],{left:100},async v=>{await aj('save/promos',v);await admGo('adm_promos')})}
+function aChs(a){return ah('📢 Majburiy obuna',`<button class="btn sm" onclick="editCh()">+ Kanal</button>`)+'<div class="mut sm" style="margin-bottom:10px">Bot kanalda ADMIN bo\'lishi shart. Kanalni bossangiz — o\'chiriladi</div>'+(a.items.map(c=>`<div class="li" onclick="delRow('channels',${c.id},()=>admGo('adm_chs'))"><div class="sp"><b>${esc(c.title||c.chat_id)}</b><div class="mut sm">${esc(c.link)}</div></div><span>🗑</span></div>`).join('')||'<div class="empty">Yo\'q</div>')}
+function editCh(){openForm('Kanal qo\'shish',[['chat_id','Kanal @username yoki ID','text']],{},async v=>{await aj('save/channels',v);await admGo('adm_chs')})}
+function aSet(a){const s=a.s;return ah('⚙️ Sozlamalar',`<button class="btn sm" onclick="editSet()">✏️ Tahrirlash</button>`)+(s.welcome_img?`<div class="card" style="padding:8px"><img src="/img/${s.welcome_img}" style="width:100%;border-radius:12px"></div>`:'')+`<div class="card">${[['Bot nomi',s.bot_name],['Yordam',s.support_link],['Kanal',s.channel_link],['Minimal to\'ldirish',money(s.min_topup||0)],['Karta vaqti',s.card_ttl+' daqiqa'],['Texnik ishlar',s.maintenance=='1'?'YOQIQ':'o\'chiq']].map(x=>`<div class="row" style="padding:6px 0"><span class="mut sm sp">${x[0]}</span><b class="sm">${esc(x[1]||'—')}</b></div>`).join('')}</div>`}
+function editSet(){openForm('Sozlamalar',SF,S.a.s,async v=>{await aj('set',v);await admGo('adm_set')})}
+function aBc(a){return ah('📨 Xabar yuborish')+`<div class="card">Hozir <b>${a.users}</b> ta foydalanuvchiga xabar yuboriladi.<button class="btn" style="margin-top:12px" onclick="editBc()">✍️ Xabar yozish</button></div>`}
+function editBc(){openForm('Xabar',[['text','Xabar matni (HTML mumkin: <b>qalin</b>)','area'],['img','Rasm (ixtiyoriy)','img']],{},async v=>{if(!(v.text||v.img))throw{err:'Matn yoki rasm kerak'};await new Promise((ok,no)=>ask('Hammaga yuborilsinmi?',async()=>{try{await aj('broadcast',v);toast('✅ Yuborilmoqda...');ok()}catch(e){no(e)}}))})}
+function aAdms(a){return ah('👮 Adminlar',`<button class="btn sm" onclick="editAdm()">+ Admin</button>`)+a.items.map(i=>`<div class="li" ${a.owners.includes(i)?'':`onclick="delAdm(${i})"`}><div class="sp"><b>${i}</b><div class="mut sm">${a.owners.includes(i)?'Asosiy admin':'Bosing → olib tashlash'}</div></div></div>`).join('')}
+function editAdm(){openForm('Yangi admin',[['id','Telegram ID','number']],{},async v=>{await aj('admin',{id:v.id});await admGo('adm_adms')})}
+function delAdm(i){ask('Olib tashlansinmi?',async()=>{await aj('admin',{id:i,remove:1});admGo('adm_adms')})}
+/* --- forma oynasi --- */
+function openForm(title,fields,vals,save,extra){F={title:title,fields:fields,vals:Object.assign({},vals),save:save,extra:extra||{}};drawForm()}
+function Fs(k,v){F.vals[k]=v}
+function closeForm(){F=null;drawForm()}
+async function fSave(){try{await F.save(F.vals);closeForm()}catch(e){toast((e&&e.err)||t('err'))}}
+function fld(f){const k=f[0],l=f[1],ty=f[2],o=f[3],v=F.vals[k]==null?'':F.vals[k];let h=`<div class="fl">${esc(l)}</div>`;
+ if(ty=='area')h+=`<textarea oninput="Fs('${k}',this.value)">${esc(v)}</textarea>`;
+ else if(ty=='sel')h+=`<select onchange="Fs('${k}',this.value)">${o.map(x=>`<option value="${x[0]}" ${x[0]==v?'selected':''}>${esc(x[1])}</option>`).join('')}</select>`;
+ else if(ty=='tog')h+=`<div class="seg" style="margin:0"><div class="${+v?'on':''}" onclick="Fs('${k}',1);drawForm()">Ha</div><div class="${+v?'':'on'}" onclick="Fs('${k}',0);drawForm()">Yo'q</div></div>`;
+ else if(ty=='img')h+=`<div class="ip">${v?`<img src="/img/${esc(v)}">`:'<span>🖼</span>'}<div><label class="btn sm" style="display:inline-block">📷 Galereyadan<input type="file" accept="image/*" hidden onchange="upImg('${k}',this)"></label> ${v?`<button class="btn o sm" onclick="Fs('${k}','');drawForm()">✕</button>`:''}</div></div><div class="row" style="margin-top:8px"><input id="u_${k}" placeholder="yoki rasm havolasi https://..." style="padding:10px;font-size:13px"><button class="btn sm" onclick="impImg('${k}')">⬇️</button></div>`;
+ else h+=`<input ${ty=='number'?'inputmode="numeric"':''} value="${esc(v)}" oninput="Fs('${k}',this.value)">`;
+ return h}
+function drawForm(){const m=$('#modal');if(!F){m.innerHTML='';return}
+ m.innerHTML=`<div class="ov" style="align-items:center"><div class="fm"><div class="row"><b class="sp">${esc(F.title)}</b><div class="ib" onclick="closeForm()">✕</div></div>${F.fields.map(fld).join('')}<div class="row" style="margin-top:16px">${F.extra.del?`<button class="btn o" style="width:60px" onclick="F.extra.del()">🗑</button>`:''}<button class="btn" onclick="fSave()">💾 Saqlash</button></div></div></div>`}
+function shrink(file,max){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>{const im=new Image();im.onload=()=>{const k=Math.min(1,max/Math.max(im.width,im.height)),w=Math.round(im.width*k),h=Math.round(im.height*k),c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,w,h);x.drawImage(im,0,0,w,h);res(c.toDataURL('image/jpeg',.86))};im.onerror=rej;im.src=r.result};r.onerror=rej;r.readAsDataURL(file)})}
+async function upImg(k,inp){const f=inp.files[0];if(!f)return;toast('⏳ Yuklanmoqda...');try{const d=await shrink(f,1000);const r=await aj('upload',{data:d});Fs(k,r.ref);drawForm();toast('✅')}catch(e){toast((e&&e.err)||t('err'))}}
+async function impImg(k){const u=$('#u_'+k).value.trim();if(!u)return;toast('⏳ Yuklanmoqda...');try{const r=await aj('import',{url:u});Fs(k,r.ref);drawForm();toast('✅')}catch(e){toast((e&&e.err)||t('err'))}}
 
-    a = Application.builder().token(BOT_TOKEN).build()
-    a.add_handler(CommandHandler("start", cmd_start))
-    a.add_handler(CommandHandler("admin", cmd_admin))
-    a.add_handler(CallbackQueryHandler(cb_check, pattern=r"^chk$"))
-    a.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^a:"))
-    a.add_handler(CallbackQueryHandler(cb_order, pattern=r"^o:"))
-    a.add_handler(CallbackQueryHandler(cb_topup, pattern=r"^t:"))
-    a.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    a.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    log.info("Bot ishga tushdi ✅")
-    a.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
+boot();
+</script></body></html>"""
 
 if __name__ == "__main__":
     main()
