@@ -1376,7 +1376,7 @@ input{width:100%;padding:14px;border-radius:14px;border:1.5px solid var(--bd);ba
 .cn{background:linear-gradient(135deg,#10132a,#2a2170);color:#fff;border-radius:18px;padding:16px;margin-bottom:12px}.cn .n{font-size:21px;font-weight:800;letter-spacing:1px;margin:8px 0}
 .warn{background:rgba(225,29,72,.08);border:1px solid rgba(225,29,72,.3);border-radius:14px;padding:12px;font-size:13px;margin-bottom:12px}
 .tm{font-weight:800;color:var(--p)}.bar{height:5px;border-radius:5px;background:var(--bd);overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--p),var(--p2))}
-#toast{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#151a30;color:#fff;padding:11px 18px;border-radius:14px;font-size:14px;z-index:9;display:none;max-width:90%}
+#tstBox{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:#151a30;color:#fff;padding:11px 18px;border-radius:14px;font-size:14px;z-index:9;display:none;max-width:90%}
 .empty{text-align:center;padding:50px 10px;color:var(--mut)}
 .gv{--bg:#0a0c18;--card:#151932;--tx:#f1f2fb;--mut:#8b90ab;--bd:#242949;background:#0a0c18;color:var(--tx);margin:-14px -14px 0;padding-bottom:100px;min-height:100vh}
 .hero2{height:200px;background:linear-gradient(135deg,#1b1147,#6d3df0);background-size:cover;background-position:center;position:relative;display:flex;align-items:flex-end;padding:16px}
@@ -1398,7 +1398,7 @@ textarea,select{width:100%;padding:12px;border-radius:14px;border:1.5px solid va
 .li{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:10px;margin-bottom:8px;cursor:pointer}.li img,.li .pi{width:44px;height:44px;border-radius:10px;object-fit:cover;flex:none}.li .sp{min-width:0}
 .hero2 .ed{position:absolute;top:12px;right:12px;background:rgba(0,0,0,.55);border-radius:10px;padding:6px 10px;font-size:13px;color:#fff}
 .gc{position:relative}.eb{position:absolute;top:3px;right:3px;background:rgba(0,0,0,.6);color:#fff;border-radius:8px;font-size:11px;padding:2px 5px;z-index:2}
-</style></head><body><div id="toast"></div><div id="app"></div><div id="modal"></div>
+</style></head><body><div id="tstBox"></div><div id="app"></div><div id="modal"></div>
 <script>
 const tg=window.Telegram.WebApp;tg.ready();tg.expand();
 const $=s=>document.querySelector(s);
@@ -1419,7 +1419,7 @@ pending:'Ожидание',done:'Выполнен',canceled:'Отменён',app
 Object.assign(T.uz,{nobal2:'Bu xarid uchun balansda mablag\' yetarli emas. Avval balansni to\'ldiring.',price:'Mahsulot narxi',short:'Yetmaydi',close:'Yopish',topbal:'Balansni to\'ldirish'});
 Object.assign(T.ru,{nobal2:'На балансе недостаточно средств для этой покупки. Сначала пополните баланс.',price:'Цена товара',short:'Не хватает',close:'Закрыть',topbal:'Пополнение баланса'});
 const t=k=>(T[S.lang]||T.uz)[k]||k;
-function toast(m){const e=$('#toast');e.textContent=m;e.style.display='block';clearTimeout(S.tt);S.tt=setTimeout(()=>e.style.display='none',2600)}
+function toast(m){const e=$('#tstBox');e.textContent=m;e.style.display='block';clearTimeout(S.tt);S.tt=setTimeout(()=>e.style.display='none',2600)}
 async function api(p,body){const hi=tg.initData||'',h={'Content-Type':'application/json'};if(/[^\x20-\x7e]/.test(hi))p+=(p.indexOf('?')>=0?'&':'?')+'_i='+encodeURIComponent(hi);else h['X-Init']=hi;
  const r=await fetch(p,{method:body!==undefined?'POST':'GET',cache:'no-store',headers:h,body:body!==undefined?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));if(!r.ok){j.status=r.status;throw j}return j}
 function ask(m,cb){tg.showConfirm?tg.showConfirm(m,ok=>ok&&cb()):(confirm(m)&&cb())}
@@ -1427,8 +1427,8 @@ function gimg(g,cls){return g.img?`<img src="/img/${g.img}" loading="lazy">`:`<d
 function gcard(g){return `<div class="gc" onclick="openGame(${g.id})">${S.d.user.admin?`<span class="eb" onclick="event.stopPropagation();admGo('adm_game',${g.id})">✏️</span>`:''}<div class="gi">${gimg(g)}</div>${esc(g.name)}</div>`}
 function go(tab,arg){S.tab=tab;S.arg=arg;clearInterval(S.tm);if(tab!='game')S.g=null;S.sheet=false;document.body.style.background=tab=='game'?'#0a0c18':'';
  const back=(tab=='game'||tab=='pay');back?tg.BackButton.show():tg.BackButton.hide();render();window.scrollTo(0,0)}
-tg.BackButton.onClick(()=>back());
-function head(){const u=S.d.user;return `<div class="row" style="margin-bottom:12px"><div class="av">${esc((u.name||'?')[0])}</div><div><div class="mut sm">${t('hi')} 👋</div><b>${esc(u.name)}</b></div><div class="sp"></div>${S.d.user.admin?`<div class="ib" onclick="admGo('adm')">🛠</div>`:''}<div class="ib" onclick="setLang()">${S.lang.toUpperCase()}</div><div class="ib" onclick="setDark()">${S.dark?'☀️':'🌙'}</div></div>`}
+tg.BackButton.onClick(()=>goBack());
+function topBar(){const u=S.d.user;return `<div class="row" style="margin-bottom:12px"><div class="av">${esc((u.name||'?')[0])}</div><div><div class="mut sm">${t('hi')} 👋</div><b>${esc(u.name)}</b></div><div class="sp"></div>${S.d.user.admin?`<div class="ib" onclick="admGo('adm')">🛠</div>`:''}<div class="ib" onclick="setLang()">${S.lang.toUpperCase()}</div><div class="ib" onclick="setDark()">${S.dark?'☀️':'🌙'}</div></div>`}
 function balCard(){return `<div class="card bal"><div style="font-size:26px">💳</div><div class="sp"><div class="mut sm">${t('bal')}</div><b>${money(S.d.user.balance)}</b> <span class="mut sm">so'm</span></div><button class="btn sm" onclick="go('topup')">+ ${t('top')}</button></div>`}
 function nav(){const a=[['home','🏠',t('home')],['games','🎮',t('games')],['topup','👛',t('top')],['orders','🕘',t('orders')],['prof','👤',t('prof')]];if(S.d.user.admin)a.push(['adm','🛠','Admin']);
  return `<div class="nav">${a.map(x=>`<div class="${S.tab==x[0]?'on':''}" onclick="${x[0]=='adm'?`admGo('adm')`:`go('${x[0]}')`}"><i>${x[1]}</i>${x[2]}</div>`).join('')}</div>`}
@@ -1440,7 +1440,7 @@ function render(){const A=$('#app');const d=S.d;if(!d)return;if(S.tab.startsWith
  if(m=='pay')tick();}
 function vHome(){const d=S.d;
  const bn=d.banners.length?d.banners.map(b=>`<div onclick="${b.link?`tg.openLink('${esc(b.link)}')`:''}"><img src="/img/${b.img}"></div>`).join(''):`<div class="hero">${esc(d.cfg.bot)}</div>`;
- return head()+balCard()+`<div class="row" style="margin-bottom:12px"><button class="btn o" onclick="go('prof')">🎟 ${t('promo')}</button><button class="btn o" onclick="sup()">🎧 ${t('sup')}</button></div><div class="ban">${bn}</div>
+ return topBar()+balCard()+`<div class="row" style="margin-bottom:12px"><button class="btn o" onclick="go('prof')">🎟 ${t('promo')}</button><button class="btn o" onclick="sup()">🎧 ${t('sup')}</button></div><div class="ban">${bn}</div>
  <div class="hd"><h3>${t('pop')}</h3><a onclick="go('games')">${t('all')}</a></div><div class="grid">${d.games.filter(g=>g.cat=='game').slice(0,8).map(gcard).join('')}</div>`}
 function sup(){const l=S.d.cfg.support;l?tg.openTelegramLink(l):toast(t('sup'))}
 function vGames(){const L=S.d.games.filter(g=>g.cat==S.seg&&g.name.toLowerCase().includes(S.q.toLowerCase()));
@@ -1490,8 +1490,8 @@ function lg(m){try{fetch('/api/log',{method:'POST',headers:{'Content-Type':'appl
 window.addEventListener('error',e=>lg('JS: '+e.message+' @'+String(e.filename||'').split('/').pop()+':'+e.lineno));
 window.addEventListener('unhandledrejection',e=>lg('PROMISE: '+((e.reason&&(e.reason.message||e.reason.err))||e.reason)));
 function showErr(e){const m=(e&&(e.err||e.message))||'',st=e&&e.status?' (HTTP '+e.status+')':'';
- const head=e&&e.err=='maintenance'?'🛠 '+t('maint'):e&&e.err=='banned'?'🚫':!tg.initData?'Ilovani botdagi «Ilovani ochish» tugmasi orqali oching':'⚠️ Xatolik'+st;
- $('#app').innerHTML=`<div class="empty" style="margin-top:70px">${head}<div class="sm" style="margin:10px 0 16px">${esc(m)}</div>${e&&(e.err=='banned'||e.err=='maintenance')?'':'<button class="btn" onclick="boot()">🔄 Qayta urinish</button>'}</div>`}
+ const hd0=e&&e.err=='maintenance'?'🛠 '+t('maint'):e&&e.err=='banned'?'🚫':!tg.initData?'Ilovani botdagi «Ilovani ochish» tugmasi orqali oching':'⚠️ Xatolik'+st;
+ $('#app').innerHTML=`<div class="empty" style="margin-top:70px">${hd0}<div class="sm" style="margin:10px 0 16px">${esc(m)}</div>${e&&(e.err=='banned'||e.err=='maintenance')?'':'<button class="btn" onclick="boot()">🔄 Qayta urinish</button>'}</div>`}
 async function boot(){let tries=0;
  while(true){try{S.d=await api('/api/init');break}catch(e){tries++;if((e&&e.status)||tries>=3){lg('INIT: '+((e&&(e.err||e.message))||e)+' st='+(e&&e.status));return showErr(e)}await new Promise(r=>setTimeout(r,1500))}}
  try{applyCfg();if(!LS.lang)S.lang=S.d.user.lang||'uz';document.body.classList.toggle('dk',S.dark||(!LS.dark&&tg.colorScheme=='dark'));if(new URLSearchParams(location.search).get('admin')&&S.d.user.admin)admGo('adm');else render()}catch(e){lg('RENDER: '+(e&&e.message));showErr(e)}}
@@ -1499,7 +1499,7 @@ async function boot(){let tries=0;
 let F=null;
 const aj=(p,b)=>api('/api/a/'+p,b||{}).then(r=>{if(/^(save|del|set|text|bulk|grpimg)/.test(p))refreshInit();return r});
 function refreshInit(){return api('/api/init').then(d=>{S.d=d;applyCfg()}).catch(()=>{})}
-function back(){const m=S.tab;if(m.startsWith('adm')){if(m=='adm')go('prof');else if(m=='adm_game')admGo('adm_games');else admGo('adm')}else go(m=='pay'?'topup':'games')}
+function goBack(){const m=S.tab;if(m.startsWith('adm')){if(m=='adm')go('prof');else if(m=='adm_game')admGo('adm_games');else admGo('adm')}else go(m=='pay'?'topup':'games')}
 async function admGo(tab,arg){S.tab=tab;S.arg=arg;S.a=null;tg.BackButton.show();clearInterval(S.tm);document.body.style.background='';render();window.scrollTo(0,0);
  try{S.a=await api('/api/a/data/'+(tab.slice(4)||'home')+'?id='+(arg||'')+'&q='+encodeURIComponent(S.aq||''))}catch(e){toast((e&&e.err)||t('err'))}
  if(S.tab==tab)render()}
@@ -1513,7 +1513,7 @@ function vAdm(){const a=S.a;if(!a)return '<div class="empty">⏳</div>';
  return ({adm:aHome,adm_games:aGames,adm_game:aGame,adm_banners:aBanners,adm_cards:aCards,adm_users:aUsers,adm_tops:aTops,adm_ords:aOrds,adm_promos:aPromos,adm_chs:aChs,adm_set:aSet,adm_adms:aAdms,adm_bc:aBc,adm_texts:aTexts}[S.tab]||aHome)(a)}
 function aHome(a){const c=(i,v,l)=>`<div class="card" style="margin:0"><div style="font-size:20px">${i}</div><b style="font-size:18px">${v}</b><div class="mut sm">${l}</div></div>`;
  const M=[['games','🎮','O\'yinlar va narxlar'],['banners','🖼','Bannerlar'],['tops','💰','To\'ldirishlar',a.p_top],['ords','📦','Buyurtmalar',a.p_ord],['users','👥','Foydalanuvchilar'],['cards','💳','Kartalar'],['promos','🎟','Promokodlar'],['chs','📢','Majburiy obuna'],['bc','📨','Xabar yuborish'],['texts','🔤','Ilova matnlari'],['set','⚙️','Sozlamalar'],['adms','👮','Adminlar']];
- return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div>${days(a)}<div class="tl">${M.map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
+ return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div>${dayStats(a)}<div class="tl">${M.map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
 function aGames(a){return ah('🎮 O\'yinlar',`<button class="btn sm" onclick="newGame()">+ O'yin</button>`)+`<div class="mut sm" style="margin-bottom:12px">O'yinni bosing → rasm, nom va narxlarni o'zgartiring</div><div class="grid">${a.games.map(g=>`<div class="gc" onclick="admGo('adm_game',${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}<div class="mut" style="font-size:10px">${g.pc} ta${g.active?'':' · 🔴'}</div></div>`).join('')}</div>`}
 function aGame(a){const g=a.game;if(!g)return '<div class="empty">—</div>';const hi=g.hero||g.img;
  const slot=(k,l,v)=>`<div class="card" style="padding:10px;margin-bottom:10px"><div class="row"><div class="ip">${v?`<img src="/img/${v}">`:'<span>🖼</span>'}</div><div class="sp"><b class="sm">${l}</b></div><label class="btn sm">📷 O'zgartirish<input type="file" accept="image/*" hidden onchange="quickGame('${k}',this)"></label><button class="btn o sm" onclick="urlGame('${k}')">🔗</button></div></div>`;
@@ -1554,7 +1554,7 @@ function editBc(){openForm('Xabar',[['text','Xabar matni (HTML mumkin: <b>qalin<
 function aAdms(a){return ah('👮 Adminlar',`<button class="btn sm" onclick="editAdm()">+ Admin</button>`)+a.items.map(i=>`<div class="li" ${a.owners.includes(i)?'':`onclick="delAdm(${i})"`}><div class="sp"><b>${i}</b><div class="mut sm">${a.owners.includes(i)?'Asosiy admin':'Bosing → olib tashlash'}</div></div></div>`).join('')}
 function editAdm(){openForm('Yangi admin',[['id','Telegram ID','number']],{},async v=>{await aj('admin',{id:v.id});await admGo('adm_adms')})}
 function delAdm(i){ask('Olib tashlansinmi?',async()=>{await aj('admin',{id:i,remove:1});admGo('adm_adms')})}
-function days(a){const mx=Math.max(1,...a.days.map(d=>d.t));return `<div class="card"><b>📈 So'nggi 7 kun</b>${a.days.map(d=>`<div class="row" style="margin-top:8px;font-size:12px"><span class="mut" style="width:42px">${d.d}</span><div class="bar sp" style="margin:0"><i style="width:${Math.round(d.t/mx*100)}%"></i></div><span style="width:128px;text-align:right">${money(d.t)} · 👤${d.u} · 📦${d.o}</span></div>`).join('')}</div>`}
+function dayStats(a){const mx=Math.max(1,...a.days.map(d=>d.t));return `<div class="card"><b>📈 So'nggi 7 kun</b>${a.days.map(d=>`<div class="row" style="margin-top:8px;font-size:12px"><span class="mut" style="width:42px">${d.d}</span><div class="bar sp" style="margin:0"><i style="width:${Math.round(d.t/mx*100)}%"></i></div><span style="width:128px;text-align:right">${money(d.t)} · 👤${d.u} · 📦${d.o}</span></div>`).join('')}</div>`}
 function aTexts(a){return ah('🔤 Ilova matnlari')+'<div class="mut sm" style="margin-bottom:10px">Matnni bosing — o\'zbekcha va ruscha variantini o\'zgartiring</div>'+Object.keys(T.uz).map(k=>`<div class="li" onclick="editText('${k}')"><div class="sp"><b>${esc(T.uz[k])}</b><div class="mut sm">${esc(T.ru[k]||'')}</div></div></div>`).join('')}
 function editText(k){openForm('Matn',[['uz','O\'zbekcha','area'],['ru','Ruscha','area']],{uz:T.uz[k],ru:T.ru[k]},async v=>{await aj('text',{k:k,uz:v.uz,ru:v.ru});T.uz[k]=v.uz;T.ru[k]=v.ru;await admGo('adm_texts')})}
 function applyCfg(){const c=S.d.cfg,ui=c.ui||{};['uz','ru'].forEach(l=>Object.assign(T[l],ui[l]||{}));if(c.c1)document.documentElement.style.setProperty('--p',c.c1);if(c.c2)document.documentElement.style.setProperty('--p2',c.c2)}
