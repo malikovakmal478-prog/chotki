@@ -563,8 +563,10 @@ def a_save(u, t):
     cols, ints = COLS[t]; vals = {}
     for c in cols:
         if c in d: vals[c] = _i(d[c]) if c in ints else str(d[c] if d[c] is not None else "").strip()
-    if t == "games" and not vals.get("name"): return jsonify(err="Nom kiriting"), 400
-    if t == "products" and (not vals.get("name") or vals.get("price", 0) <= 0): return jsonify(err="Nom va narxni kiriting"), 400
+    if t == "games" and not d.get("id") and not vals.get("name"): return jsonify(err="Nom kiriting"), 400
+    if t == "games" and "name" in vals and not vals["name"]: return jsonify(err="Nom kiriting"), 400
+    if t == "products" and not d.get("id") and (not vals.get("name") or vals.get("price", 0) <= 0): return jsonify(err="Nom va narxni kiriting"), 400
+    if t == "products" and d.get("id") and (("name" in vals and not vals["name"]) or ("price" in vals and vals["price"] <= 0)): return jsonify(err="Nom va narxni kiriting"), 400
     if t == "banners" and not vals.get("img"): return jsonify(err="Rasm tanlang"), 400
     if t == "cards" and "number" in vals:
         dg = re.sub(r"\D", "", vals["number"])
@@ -605,6 +607,15 @@ def a_bulk(u):
                (int(d["game_id"]), pt[0], _i(pt[1]), pt[2] if len(pt) > 2 else "", pt[3] if len(pt) > 3 else "")); n += 1
     if not n: return jsonify(err="Format: nom | narx | guruh | belgi"), 400
     return jsonify(ok=True, n=n)
+
+@web.route("/api/a/grpimg", methods=["POST"])
+@need_admin
+def a_grpimg(u):
+    d = request.get_json(silent=True) or {}; img = str(d.get("img", "")).strip()
+    if not img: return jsonify(err="Rasm tanlang"), 400
+    if d.get("grp") == "*": ex("update products set img=? where game_id=?", (img, int(d["game_id"])))
+    else: ex("update products set img=? where game_id=? and grp=?", (img, int(d["game_id"]), str(d.get("grp", ""))))
+    return jsonify(ok=True)
 
 @web.route("/api/a/upload", methods=["POST"])
 @need_admin
@@ -1376,6 +1387,7 @@ textarea,select{width:100%;padding:12px;border-radius:14px;border:1.5px solid va
 .ip{display:flex;align-items:center;gap:12px}.ip img,.ip span{width:84px;height:62px;border-radius:12px;object-fit:cover;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:24px;flex:none}
 .li{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:10px;margin-bottom:8px;cursor:pointer}.li img,.li .pi{width:44px;height:44px;border-radius:10px;object-fit:cover;flex:none}.li .sp{min-width:0}
 .hero2 .ed{position:absolute;top:12px;right:12px;background:rgba(0,0,0,.55);border-radius:10px;padding:6px 10px;font-size:13px;color:#fff}
+.gc{position:relative}.eb{position:absolute;top:3px;right:3px;background:rgba(0,0,0,.6);color:#fff;border-radius:8px;font-size:11px;padding:2px 5px;z-index:2}
 </style></head><body><div id="toast"></div><div id="app"></div><div id="modal"></div>
 <script>
 const tg=window.Telegram.WebApp;tg.ready();tg.expand();
@@ -1400,7 +1412,7 @@ function toast(m){const e=$('#toast');e.textContent=m;e.style.display='block';cl
 async function api(p,body){const r=await fetch(p,{method:body!==undefined?'POST':'GET',headers:{'Content-Type':'application/json','X-Init':tg.initData},body:body!==undefined?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw j;return j}
 function ask(m,cb){tg.showConfirm?tg.showConfirm(m,ok=>ok&&cb()):(confirm(m)&&cb())}
 function gimg(g,cls){return g.img?`<img src="/img/${g.img}" loading="lazy">`:`<div class="ph">${esc(g.name[0])}</div>`}
-function gcard(g){return `<div class="gc" onclick="openGame(${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}</div>`}
+function gcard(g){return `<div class="gc" onclick="openGame(${g.id})">${S.d.user.admin?`<span class="eb" onclick="event.stopPropagation();admGo('adm_game',${g.id})">✏️</span>`:''}<div class="gi">${gimg(g)}</div>${esc(g.name)}</div>`}
 function go(tab,arg){S.tab=tab;S.arg=arg;clearInterval(S.tm);if(tab!='game')S.g=null;S.sheet=false;document.body.style.background=tab=='game'?'#0a0c18':'';
  const back=(tab=='game'||tab=='pay');back?tg.BackButton.show():tg.BackButton.hide();render();window.scrollTo(0,0)}
 tg.BackButton.onClick(()=>back());
@@ -1427,7 +1439,7 @@ function infoRow(i){return `<div class="info" onclick="${i.link?`tg.openLink('${
 function vGame(){const g=S.g;if(!g)return `<div class="empty">⏳</div>`;
  const grps=[...new Set(g.products.map(p=>p.grp||''))];if(S.grp==null||!grps.includes(S.grp))S.grp=grps[0]||'';
  const L=g.products.filter(p=>(p.grp||'')==S.grp),hi=g.hero||g.img;
- return `<div class="gv"><div class="hero2" style="${hi?`background-image:url(/img/${hi})`:''}"><div class="hs"></div><h2>${esc(g.name)}</h2></div>${g.info?infoRow(g.info):''}
+ return `<div class="gv"><div class="hero2" style="${hi?`background-image:url(/img/${hi})`:''}"><div class="hs"></div><h2>${esc(g.name)}</h2>${S.d.user.admin?`<span class="ed" onclick="admGo('adm_game',${g.id})">✏️ Tahrirlash</span>`:''}</div>${g.info?infoRow(g.info):''}
  ${(grps.length>1||grps[0])?`<div class="tabs">${grps.map(x=>`<span class="${x==S.grp?'on':''}" data-g="${esc(x)}" onclick="S.grp=this.dataset.g;render()">${esc(x)}</span>`).join('')}</div>`:''}
  <div class="gt">${t('pick')}</div><div class="pg">${L.length?L.map(p=>`<div class="pc" onclick="selP(${p.id})">${p.img?`<img src="/img/${p.img}" loading="lazy">`:`<div class="pi">${esc(g.name[0])}</div>`}<div class="pt"><b>${esc(p.name)}${p.badge?` <em>${esc(p.badge)}</em>`:''}</b><span>${money(p.price)} <small>so'm</small></span></div></div>`).join(''):`<div class="empty" style="grid-column:1/3">${t('noprod')}</div>`}</div></div>`}
 function selP(id){S.sel=S.g.products.find(x=>x.id==id);S.sheet=true;render()}
@@ -1466,7 +1478,8 @@ async function boot(){try{S.d=await api('/api/init');applyCfg();if(!localStorage
  catch(e){$('#app').innerHTML=`<div class="empty" style="margin-top:80px">${e.err=='maintenance'?'🛠 '+t('maint'):e.err=='banned'?'🚫':'Telegram ichida oching'}</div>`}}
 /* ===== ADMIN PANEL ===== */
 let F=null;
-const aj=(p,b)=>api('/api/a/'+p,b||{});
+const aj=(p,b)=>api('/api/a/'+p,b||{}).then(r=>{if(/^(save|del|set|text|bulk|grpimg)/.test(p))refreshInit();return r});
+function refreshInit(){return api('/api/init').then(d=>{S.d=d;applyCfg()}).catch(()=>{})}
 function back(){const m=S.tab;if(m.startsWith('adm')){if(m=='adm')go('prof');else if(m=='adm_game')admGo('adm_games');else admGo('adm')}else go(m=='pay'?'topup':'games')}
 async function admGo(tab,arg){S.tab=tab;S.arg=arg;S.a=null;tg.BackButton.show();clearInterval(S.tm);document.body.style.background='';render();window.scrollTo(0,0);
  try{S.a=await api('/api/a/data/'+(tab.slice(4)||'home')+'?id='+(arg||'')+'&q='+encodeURIComponent(S.aq||''))}catch(e){toast((e&&e.err)||t('err'))}
@@ -1484,9 +1497,16 @@ function aHome(a){const c=(i,v,l)=>`<div class="card" style="margin:0"><div styl
  return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div>${days(a)}<div class="tl">${M.map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
 function aGames(a){return ah('🎮 O\'yinlar',`<button class="btn sm" onclick="newGame()">+ O'yin</button>`)+`<div class="mut sm" style="margin-bottom:12px">O'yinni bosing → rasm, nom va narxlarni o'zgartiring</div><div class="grid">${a.games.map(g=>`<div class="gc" onclick="admGo('adm_game',${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}<div class="mut" style="font-size:10px">${g.pc} ta${g.active?'':' · 🔴'}</div></div>`).join('')}</div>`}
 function aGame(a){const g=a.game;if(!g)return '<div class="empty">—</div>';const hi=g.hero||g.img;
- return ah(esc(g.name),`<button class="btn sm" onclick="editGame()">✏️ Tahrirlash</button>`)+`<div class="hero2" style="border-radius:18px;margin-bottom:12px;${hi?`background-image:url(/img/${hi})`:''}" onclick="editGame()"><div class="hs"></div><h2>${esc(g.name)}</h2><span class="ed">🖼 Rasmni o'zgartirish</span></div>
- <div class="hd"><b>Mahsulotlar (${a.products.length})</b><span><button class="btn sm" onclick="newProd()">+ Mahsulot</button> <button class="btn o sm" onclick="bulkProd()">📥</button></span></div>`+
- (a.products.map(p=>`<div class="li" onclick="editProd(${p.id})">${(p.img||g.picon)?`<img src="/img/${p.img||g.picon}">`:`<div class="pi">${esc(g.name[0])}</div>`}<div class="sp"><b>${esc(p.name)}</b>${p.badge?` <span class="tag pending">${esc(p.badge)}</span>`:''}<div class="mut sm">${esc(p.grp||'—')}${p.active?'':' · 🔴 yashirin'}</div></div><b>${money(p.price)}</b></div>`).join('')||'<div class="empty">Mahsulot yo\'q. «+ Mahsulot» yoki 📥 ni bosing</div>')}
+ const slot=(k,l,v)=>`<div class="card" style="padding:10px;margin-bottom:10px"><div class="row"><div class="ip">${v?`<img src="/img/${v}">`:'<span>🖼</span>'}</div><div class="sp"><b class="sm">${l}</b></div><label class="btn sm">📷 O'zgartirish<input type="file" accept="image/*" hidden onchange="quickGame('${k}',this)"></label><button class="btn o sm" onclick="urlGame('${k}')">🔗</button></div></div>`;
+ return ah(esc(g.name),`<button class="btn sm" onclick="editGame()">✏️ Tahrirlash</button>`)+`<div class="hero2" style="border-radius:18px;margin-bottom:12px;${hi?`background-image:url(/img/${hi})`:''}"><div class="hs"></div><h2>${esc(g.name)}</h2></div>
+ <b>🖼 O'yin rasmlari</b><div style="height:8px"></div>${slot('img','Kichik ikonka (ro\'yxatda)',g.img)}${slot('hero','Katta banner (sahifa tepasi)',g.hero)}${slot('picon','Mahsulotlar umumiy ikonkasi',g.picon)}
+ <div class="hd"><b>Mahsulotlar (${a.products.length})</b><span><button class="btn sm" onclick="newProd()">+ Mahsulot</button> <button class="btn o sm" onclick="bulkProd()">📥</button> <button class="btn o sm" onclick="grpImg()">🖼 Guruhga</button></span></div>`+
+ (a.products.map(p=>`<div class="li" onclick="editProd(${p.id})">${(p.img||g.picon)?`<img src="/img/${p.img||g.picon}">`:`<div class="pi">${esc(g.name[0])}</div>`}<div class="sp"><b>${esc(p.name)}</b>${p.badge?` <span class="tag pending">${esc(p.badge)}</span>`:''}<div class="mut sm">${esc(p.grp||'—')}${p.active?'':' · 🔴 yashirin'}</div></div><b>${money(p.price)}</b><label class="ib" onclick="event.stopPropagation()">📷<input type="file" accept="image/*" hidden onchange="quickProd(${p.id},this)"></label></div>`).join('')||'<div class="empty">Mahsulot yo\'q. «+ Mahsulot» yoki 📥 ni bosing</div>')}
+async function quickUp(inp){const f=inp.files[0];if(!f)return null;toast('⏳ Yuklanmoqda...');const d=await shrink(f,1000);return (await aj('upload',{data:d})).ref}
+async function quickGame(k,inp){try{const ref=await quickUp(inp);if(!ref)return;const o={id:S.a.game.id};o[k]=ref;await aj('save/games',o);toast('✅ Saqlandi');admGo('adm_game',S.a.game.id)}catch(e){toast((e&&e.err)||t('err'))}}
+async function quickProd(id,inp){try{const ref=await quickUp(inp);if(!ref)return;await aj('save/products',{id:id,img:ref});toast('✅ Saqlandi');admGo('adm_game',S.a.game.id)}catch(e){toast((e&&e.err)||t('err'))}}
+function urlGame(k){openForm('Rasm',[[k,'Rasm (galereya yoki havola)','img']],S.a.game,async v=>{const o={id:S.a.game.id};o[k]=v[k];await aj('save/games',o);await admGo('adm_game',S.a.game.id)})}
+function grpImg(){const g=S.a.game,gr=[...new Set(S.a.products.map(p=>p.grp||''))];openForm('Guruhdagi hamma mahsulotga rasm',[['grp','Qaysi guruh','sel',[['*','Hamma mahsulotlar']].concat(gr.map(x=>[x,x||'(guruhsiz)']))],['img','Rasm','img']],{grp:'*'},async v=>{if(!v.img)throw{err:'Rasm tanlang'};await aj('grpimg',{game_id:g.id,grp:v.grp,img:v.img});await admGo('adm_game',g.id)})}
 function editGame(){const g=S.a.game;openForm('O\'yin',GF,g,async v=>{await aj('save/games',Object.assign({},v,{id:g.id}));await admGo('adm_game',g.id)},{del:()=>delRow('games',g.id,()=>admGo('adm_games'))})}
 function newGame(){openForm('Yangi o\'yin',GF,{cat:'game',field:'Player ID',active:1},async v=>{const r=await aj('save/games',v);await admGo('adm_game',r.id)})}
 function newProd(){const g=S.a.game;openForm('Yangi mahsulot',PF,{active:1},async v=>{await aj('save/products',Object.assign({},v,{game_id:g.id}));await admGo('adm_game',g.id)})}
