@@ -312,7 +312,7 @@ web = Flask(__name__)
 web.config['MAX_CONTENT_LENGTH'] = 14 * 1024 * 1024
 
 def auth():
-    init = request.headers.get("X-Init", "")
+    init = request.headers.get("X-Init", "") or request.args.get("_i", "")
     try:
         data = dict(urllib.parse.parse_qsl(init, keep_blank_values=True))
         h = data.pop("hash")
@@ -340,6 +340,16 @@ def need_user(f):
 def index():
     r = Response(INDEX.replace("__BOT__", E(gs("bot_name"))), mimetype="text/html")
     r.headers["Cache-Control"] = "no-store"; return r
+
+_logn = {"n": 0, "t": 0}
+@web.route("/api/log", methods=["POST"])
+def api_log():
+    if time.time() - _logn["t"] > 60: _logn.update(n=0, t=time.time())
+    _logn["n"] += 1
+    if _logn["n"] <= 20:
+        d = request.get_json(silent=True) or {}
+        log.warning("CLIENT %s | initData=%s | %s", str(d.get("m"))[:400], d.get("init"), str(d.get("ua"))[:160])
+    return "ok"
 
 @web.route("/health")
 def health():
@@ -1394,7 +1404,8 @@ const tg=window.Telegram.WebApp;tg.ready();tg.expand();
 const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money=n=>Number(n).toLocaleString('ru-RU').replace(/\u00a0/g,' ');
-const S={lang:localStorage.lang||'uz',dark:localStorage.dark==='1',tab:'home',d:null,amt:50000,seg:'game',oseg:'o',q:'',player:'',pid:null};
+const LS=(()=>{try{window.localStorage.getItem('x');return window.localStorage}catch(e){return {}}})();
+const S={lang:LS.lang||'uz',dark:LS.dark==='1',tab:'home',d:null,amt:50000,seg:'game',oseg:'o',q:'',player:'',pid:null};
 const T={uz:{hi:'Salom',bal:'BALANS',top:'To\'ldirish',promo:'Promokodlar',sup:'Yordam',pop:'Mashhur o\'yinlar',all:'Barchasi',home:'Asosiy',games:'O\'yinlar',orders:'Buyurtmalar',prof:'Profil',tx:'Tranzaksiyalar',search:'O\'yin yoki xizmatni qidiring',
 amount:'Summani kiriting',min:'Minimum',steps:'To\'ldirish qadamlari',s1:'To\'lov summasini tanlang',s2:'Ko\'rsatilgan kartaga AYNAN shu summani o\'tkazing',s3:'"Men to\'ladim" tugmasini bosing',s4:'Admin tasdiqlagach balansingiz to\'ldiriladi',
 exact:'Aynan shu summani o\'tkazing',one:'Faqat BITTA o\'tkazma',onet:'Summani bo\'lmang va yaxlitlamang.',valid:'Karta amal qilish vaqti',card:'Karta raqami',copy:'Nusxalash',copied:'Nusxalandi',paid:'Men to\'ladim',rules:'To\'lov qoidalari',r1:'Summani 1 so\'mga ham o\'zgartirmang',r2:'Vaqt ichida to\'lang',r3:'Boshqa summa yubormang',r4:'Summani ikkiga bo\'lmang',
@@ -1409,7 +1420,8 @@ Object.assign(T.uz,{nobal2:'Bu xarid uchun balansda mablag\' yetarli emas. Avval
 Object.assign(T.ru,{nobal2:'На балансе недостаточно средств для этой покупки. Сначала пополните баланс.',price:'Цена товара',short:'Не хватает',close:'Закрыть',topbal:'Пополнение баланса'});
 const t=k=>(T[S.lang]||T.uz)[k]||k;
 function toast(m){const e=$('#toast');e.textContent=m;e.style.display='block';clearTimeout(S.tt);S.tt=setTimeout(()=>e.style.display='none',2600)}
-async function api(p,body){const r=await fetch(p,{method:body!==undefined?'POST':'GET',headers:{'Content-Type':'application/json','X-Init':tg.initData},body:body!==undefined?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw j;return j}
+async function api(p,body){const hi=tg.initData||'',h={'Content-Type':'application/json'};if(/[^\x20-\x7e]/.test(hi))p+=(p.indexOf('?')>=0?'&':'?')+'_i='+encodeURIComponent(hi);else h['X-Init']=hi;
+ const r=await fetch(p,{method:body!==undefined?'POST':'GET',cache:'no-store',headers:h,body:body!==undefined?JSON.stringify(body):undefined});const j=await r.json().catch(()=>({}));if(!r.ok){j.status=r.status;throw j}return j}
 function ask(m,cb){tg.showConfirm?tg.showConfirm(m,ok=>ok&&cb()):(confirm(m)&&cb())}
 function gimg(g,cls){return g.img?`<img src="/img/${g.img}" loading="lazy">`:`<div class="ph">${esc(g.name[0])}</div>`}
 function gcard(g){return `<div class="gc" onclick="openGame(${g.id})">${S.d.user.admin?`<span class="eb" onclick="event.stopPropagation();admGo('adm_game',${g.id})">✏️</span>`:''}<div class="gi">${gimg(g)}</div>${esc(g.name)}</div>`}
@@ -1472,10 +1484,17 @@ function vProf(){const u=S.d.user;return `<div class="card" style="text-align:ce
  `<div class="card"><b>🎟 ${t('promo')}</b><input id="pc" placeholder="${t('pr_in')}" style="margin:10px 0;text-transform:uppercase"><button class="btn" onclick="actPromo()">${t('act')}</button></div>
  <div class="card"><b>🌐 ${t('lang')}</b><div class="seg" style="margin:10px 0 0"><div class="${S.lang=='uz'?'on':''}" onclick="setLang('uz')">O'zbekcha</div><div class="${S.lang=='ru'?'on':''}" onclick="setLang('ru')">Русский</div></div></div>${u.admin?`<button class="btn" onclick="admGo('adm')">🛠 Admin panel</button>`:''}<div class="mut sm" style="text-align:center;margin-top:12px">Syrexa v4</div>`}
 async function actPromo(){const c=$('#pc').value.trim();if(!c)return;try{const r=await api('/api/promo',{code:c});S.d.user.balance=r.balance;toast('✅ +'+money(r.amount));render()}catch(e){toast(t('bad'))}}
-function setLang(l){S.lang=l||(S.lang=='uz'?'ru':'uz');localStorage.lang=S.lang;S.d.user.lang=S.lang;api('/api/lang',{lang:S.lang}).catch(()=>{});render()}
-function setDark(){S.dark=!S.dark;localStorage.dark=S.dark?'1':'0';document.body.classList.toggle('dk',S.dark);render()}
-async function boot(){try{S.d=await api('/api/init');applyCfg();if(!localStorage.lang)S.lang=S.d.user.lang||'uz';document.body.classList.toggle('dk',S.dark||(!localStorage.dark&&tg.colorScheme=='dark'));if(new URLSearchParams(location.search).get('admin')&&S.d.user.admin)admGo('adm');else render()}
- catch(e){$('#app').innerHTML=`<div class="empty" style="margin-top:80px">${e.err=='maintenance'?'🛠 '+t('maint'):e.err=='banned'?'🚫':'Telegram ichida oching'}</div>`}}
+function setLang(l){S.lang=l||(S.lang=='uz'?'ru':'uz');LS.lang=S.lang;S.d.user.lang=S.lang;api('/api/lang',{lang:S.lang}).catch(()=>{});render()}
+function setDark(){S.dark=!S.dark;LS.dark=S.dark?'1':'0';document.body.classList.toggle('dk',S.dark);render()}
+function lg(m){try{fetch('/api/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({m:String(m).slice(0,400),ua:navigator.userAgent,init:!!tg.initData})})}catch(x){}}
+window.addEventListener('error',e=>lg('JS: '+e.message+' @'+String(e.filename||'').split('/').pop()+':'+e.lineno));
+window.addEventListener('unhandledrejection',e=>lg('PROMISE: '+((e.reason&&(e.reason.message||e.reason.err))||e.reason)));
+function showErr(e){const m=(e&&(e.err||e.message))||'',st=e&&e.status?' (HTTP '+e.status+')':'';
+ const head=e&&e.err=='maintenance'?'🛠 '+t('maint'):e&&e.err=='banned'?'🚫':!tg.initData?'Ilovani botdagi «Ilovani ochish» tugmasi orqali oching':'⚠️ Xatolik'+st;
+ $('#app').innerHTML=`<div class="empty" style="margin-top:70px">${head}<div class="sm" style="margin:10px 0 16px">${esc(m)}</div>${e&&(e.err=='banned'||e.err=='maintenance')?'':'<button class="btn" onclick="boot()">🔄 Qayta urinish</button>'}</div>`}
+async function boot(){let tries=0;
+ while(true){try{S.d=await api('/api/init');break}catch(e){tries++;if((e&&e.status)||tries>=3){lg('INIT: '+((e&&(e.err||e.message))||e)+' st='+(e&&e.status));return showErr(e)}await new Promise(r=>setTimeout(r,1500))}}
+ try{applyCfg();if(!LS.lang)S.lang=S.d.user.lang||'uz';document.body.classList.toggle('dk',S.dark||(!LS.dark&&tg.colorScheme=='dark'));if(new URLSearchParams(location.search).get('admin')&&S.d.user.admin)admGo('adm');else render()}catch(e){lg('RENDER: '+(e&&e.message));showErr(e)}}
 /* ===== ADMIN PANEL ===== */
 let F=null;
 const aj=(p,b)=>api('/api/a/'+p,b||{}).then(r=>{if(/^(save|del|set|text|bulk|grpimg)/.test(p))refreshInit();return r});
