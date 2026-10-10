@@ -58,7 +58,10 @@ DEFAULTS = {
     "welcome_uz": "Xush kelibsiz, {name}! 👋\n\nSyrexa — o'yinlarni tez, ishonchli va xavfsiz to'ldirish xizmati.",
     "welcome_ru": "Добро пожаловать, {name}! 👋\n\nSyrexa — быстрое, надёжное и безопасное пополнение игр.",
     "support_link": "", "channel_link": "", "min_topup": "1000", "card_ttl": "5",
-    "welcome_img": "", "maintenance": "0",
+    "welcome_img": "", "maintenance": "0", "color1": "#7c5cff", "color2": "#a78bfa", "ui": "{}",
+    "btn_app": "📱 Ilovani ochish", "btn_channel": "Bizning kanal", "btn_support": "Yordam",
+    "bot_about": "🚀 O'yinlarni tez, ishonchli va xavfsiz to'ldirish xizmati",
+    "bot_desc": "Syrexa — PUBG UC, Free Fire Diamonds, Mobile Legends, Telegram Stars va Premium hamda boshqa o'yin xizmatlarini tez va xavfsiz to'ldirish. Boshlash uchun «Ilovani ochish» tugmasini bosing.",
 }
 SEED_GAMES = [("PUBG Mobile", "game"), ("Free Fire", "game"), ("Mobile Legends", "game"), ("Honor of Kings", "game"),
               ("Standoff 2", "game"), ("Steam Top Up", "game"), ("Telegram Stars", "game"), ("Telegram Premium", "game"),
@@ -85,6 +88,7 @@ def init_db():
     if not q1("select 1 x from games"):
         for i, (n, c) in enumerate(SEED_GAMES):
             ex("insert into games(name,cat,sort) values(?,?,?)", (n, c, i))
+    seed_catalog()
 
 def gs(k):
     r = q1("select v from settings where k=?", (k,))
@@ -142,6 +146,167 @@ def topup_kb(tid):
 def ulink(u):
     return f'<a href="tg://user?id={u["id"]}">{E(u["name"] or str(u["id"]))}</a> (<code>{u["id"]}</code>)'
 
+# ============================ STANDART RASMLAR (SVG) + TAYYOR KATALOG ============================
+# Rasmiy o'yin rasmlari mualliflik huquqi ostida, shuning uchun har o'yinga o'ziga xos chizilgan
+# standart rasm beriladi. Admin paneldan istalgan rasmni o'zingiznikiga almashtirasiz.
+_GL = {
+    "star": '<polygon points="50,8 61,38 93,38 67,57 77,89 50,70 23,89 33,57 7,38 39,38"/>',
+    "star2": '<circle cx="50" cy="50" r="44" fill="none" stroke="#fff" stroke-width="6"/><polygon points="50,8 61,38 93,38 67,57 77,89 50,70 23,89 33,57 7,38 39,38" transform="translate(14 14) scale(.72)"/>',
+    "flame": '<path d="M50 6 C56 28 82 40 80 66 C78 86 64 95 50 95 C36 95 22 86 22 66 C22 50 32 42 38 28 C42 40 47 42 50 6Z"/><path d="M50 52 C54 62 64 66 62 78 C61 86 56 90 50 90 C44 90 39 86 38 78 C37 68 47 62 50 52Z" fill="@C"/>',
+    "gem": '<polygon points="50,8 90,36 50,94 10,36"/><polyline points="10,36 90,36 M30,36 50,94 70,36 50,8 30,36" fill="none" stroke="@C" stroke-width="4"/>',
+    "crown": '<polygon points="8,76 14,26 36,50 50,16 64,50 86,26 92,76"/><rect x="8" y="80" width="84" height="10" rx="4"/>',
+    "helmet": '<path d="M13 64 C13 30 33 12 52 12 C74 12 89 32 87 64Z"/><rect x="8" y="64" width="84" height="10" rx="5"/><path d="M30 76 L36 92 L64 92 L70 76Z" fill-opacity=".75"/><rect x="52" y="34" width="30" height="9" rx="4" fill="@C"/>',
+    "cross": '<circle cx="50" cy="50" r="28" fill="none" stroke="#fff" stroke-width="7"/><rect x="46" y="4" width="8" height="26"/><rect x="46" y="70" width="8" height="26"/><rect x="4" y="46" width="26" height="8"/><rect x="70" y="46" width="26" height="8"/><circle cx="50" cy="50" r="6"/>',
+    "sword": '<polygon points="50,4 59,56 41,56"/><rect x="28" y="56" width="44" height="9" rx="4"/><rect x="45" y="65" width="10" height="22"/><circle cx="50" cy="91" r="6"/>',
+    "cube": '<polygon points="50,6 91,28 91,72 50,94 9,72 9,28"/><path d="M9 28 L50 50 L91 28 M50 50 L50 94" fill="none" stroke="@C" stroke-width="5"/>',
+    "pad": '<rect x="6" y="28" width="88" height="48" rx="24"/><rect x="22" y="48" width="24" height="8" fill="@C"/><rect x="30" y="40" width="8" height="24" fill="@C"/><circle cx="66" cy="46" r="5.5" fill="@C"/><circle cx="79" cy="57" r="5.5" fill="@C"/>',
+    "shield": '<path d="M50 6 L90 21 V50 C90 73 71 87 50 95 C29 87 10 73 10 50 V21Z"/><polygon points="50,28 56,44 73,44 59,54 64,70 50,60 36,70 41,54 27,44 44,44" fill="@C"/>',
+    "skull": '<path d="M50 8 C25 8 12 27 16 48 C18 57 25 61 30 63 L30 80 H70 V63 C75 61 82 57 84 48 C88 27 75 8 50 8Z"/><circle cx="36" cy="46" r="9" fill="@C"/><circle cx="64" cy="46" r="9" fill="@C"/><polygon points="50,56 44,68 56,68" fill="@C"/>',
+    "gear": '<circle cx="50" cy="50" r="30" fill="none" stroke="#fff" stroke-width="13" stroke-dasharray="12.5 7.5"/><circle cx="50" cy="50" r="21"/><circle cx="50" cy="50" r="9" fill="@C"/>',
+    "live": '<circle cx="50" cy="50" r="40" fill="none" stroke="#fff" stroke-width="8"/><polygon points="39,30 71,50 39,70"/>',
+}
+ART = {
+    "pubg": ("#f59e0b", "#7c2d12", "helmet"), "freefire": ("#fb923c", "#b91c1c", "flame"),
+    "mlbb": ("#3b82f6", "#1e1b4b", "gem"), "hok": ("#f59e0b", "#7c3aed", "sword"),
+    "standoff2": ("#64748b", "#0f172a", "cross"), "steam": ("#2563eb", "#0b1b3a", "gear"),
+    "stars": ("#38bdf8", "#4f46e5", "star"), "premium": ("#a855f7", "#4338ca", "star2"),
+    "bigo": ("#22c55e", "#065f46", "live"), "coc": ("#84cc16", "#a16207", "shield"),
+    "brawl": ("#facc15", "#9333ea", "skull"), "royale": ("#3b82f6", "#1d4ed8", "crown"),
+    "roblox": ("#ef4444", "#7f1d1d", "cube"), "discord": ("#6366f1", "#312e81", "pad"),
+}
+_GRAD = '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="{a}"/><stop offset="1" stop-color="{b}"/></linearGradient><radialGradient id="r" cx=".3" cy=".2" r=".9"><stop offset="0" stop-color="#fff" stop-opacity=".4"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient></defs>'
+_NS = 'xmlns="http://www.w3.org/2000/svg"'
+
+def _gl(g, c): return _GL[g].replace("@C", c)
+
+def icon_svg(slug):
+    c1, c2, g = ART[slug]
+    return (f'<svg {_NS} viewBox="0 0 200 200">{_GRAD.format(a=c1, b=c2)}<rect width="200" height="200" fill="url(#g)"/><rect width="200" height="200" fill="url(#r)"/>'
+            f'<g transform="translate(36 36) scale(1.28)" fill="#fff">{_gl(g, c2)}</g></svg>')
+
+def hero_svg(slug):
+    c1, c2, g = ART[slug]; rnd = random.Random(slug); gl = _gl(g, c2)
+    dots = "".join(f'<circle cx="{rnd.randint(0, 800)}" cy="{rnd.randint(0, 400)}" r="{rnd.randint(2, 9)}" fill="#fff" fill-opacity="{rnd.random() * .35:.2f}"/>' for _ in range(22))
+    return (f'<svg {_NS} viewBox="0 0 800 400" preserveAspectRatio="xMidYMid slice">{_GRAD.format(a=c2, b=c1)}<rect width="800" height="400" fill="url(#g)"/>'
+            f'<rect width="800" height="400" fill="url(#r)"/>{dots}<g fill="#fff" fill-opacity=".13" transform="translate(380 -40) scale(4.6)">{gl}</g>'
+            f'<g fill="#fff" transform="translate(556 96) scale(2)">{gl}</g></svg>')
+
+BANNERS = {"1": ("pubg", "PUBG Mobile UC", "Tez · Ishonchli · Xavfsiz"), "2": ("freefire", "Free Fire Diamonds", "Bir zumda hisobingizda"),
+           "3": ("stars", "Telegram Stars & Premium", "Eng qulay narxlarda")}
+def banner_svg(n):
+    slug, t1, t2 = BANNERS[n]; c1, c2, g = ART[slug]; gl = _gl(g, c2); rnd = random.Random("b" + n)
+    dots = "".join(f'<circle cx="{rnd.randint(0, 840)}" cy="{rnd.randint(0, 400)}" r="{rnd.randint(2, 8)}" fill="#fff" fill-opacity="{rnd.random() * .3:.2f}"/>' for _ in range(20))
+    fs = 54 if len(t1) <= 18 else 40; t1 = html.escape(t1)
+    return (f'<svg {_NS} viewBox="0 0 840 400" preserveAspectRatio="xMidYMid slice">{_GRAD.format(a=c2, b=c1)}<rect width="840" height="400" fill="url(#g)"/><rect width="840" height="400" fill="url(#r)"/>{dots}'
+            f'<g fill="#fff" fill-opacity=".16" transform="translate(430 -30) scale(4.4)">{gl}</g><g fill="#fff" transform="translate(600 100) scale(1.9)">{gl}</g>'
+            f'<text x="44" y="180" font-size="{fs}" font-weight="900" fill="#fff" font-family="Arial,Helvetica,sans-serif">{t1}</text>'
+            f'<text x="44" y="236" font-size="27" fill="#fff" fill-opacity=".88" font-family="Arial,Helvetica,sans-serif">{html.escape(t2)}</text>'
+            f'<rect x="44" y="290" width="170" height="52" rx="26" fill="#fff"/><text x="129" y="325" font-size="24" font-weight="800" text-anchor="middle" fill="{c2}" font-family="Arial,Helvetica,sans-serif">SYREXA</text></svg>')
+
+PK = {"uc": ("coin", "#fbbf24", "#b45309", "UC"), "gold": ("coin", "#fde047", "#a16207", "G"), "robux": ("coin", "#f87171", "#991b1b", "R$"),
+      "token": ("coin", "#fbbf24", "#92400e", "T"), "gem": ("gem", "#67e8f9", "#0e7490", ""), "gemb": ("gem", "#60a5fa", "#1d4ed8", ""),
+      "gemg": ("gem", "#86efac", "#15803d", ""), "gemp": ("gem", "#d8b4fe", "#7e22ce", ""), "star": ("star", "#fde047", "#f59e0b", ""),
+      "pass": ("pass", "#c084fc", "#6d28d9", ""), "crown": ("crown", "#fcd34d", "#d97706", ""), "plane": ("plane", "#38bdf8", "#0369a1", "")}
+def pk_svg(kind):
+    shape, a, b, txt = PK[kind]
+    if shape == "coin":
+        body = (f'<circle cx="50" cy="50" r="42" fill="url(#g)" stroke="{b}" stroke-width="4"/><circle cx="50" cy="50" r="33" fill="none" stroke="#fff" stroke-opacity=".55" stroke-width="3"/>'
+                f'<text x="50" y="{61 if len(txt) < 3 else 60}" font-size="{30 if len(txt) < 3 else 26}" font-weight="900" text-anchor="middle" fill="#fff" stroke="{b}" stroke-width="2" paint-order="stroke" font-family="Arial,sans-serif">{txt}</text>')
+    elif shape == "gem":
+        body = (f'<polygon points="50,6 92,36 50,95 8,36" fill="url(#g)" stroke="{b}" stroke-width="3" stroke-linejoin="round"/><polygon points="8,36 92,36 50,6" fill="#fff" fill-opacity=".35"/>'
+                '<polyline points="30,36 50,95 70,36" fill="none" stroke="#fff" stroke-opacity=".55" stroke-width="3"/>')
+    elif shape == "star":
+        body = f'<polygon points="50,6 62,37 95,37 68,57 78,90 50,70 22,90 32,57 5,37 38,37" fill="url(#g)" stroke="{b}" stroke-width="3" stroke-linejoin="round"/>'
+    elif shape == "pass":
+        body = (f'<rect x="6" y="22" width="88" height="56" rx="10" fill="url(#g)" stroke="{b}" stroke-width="3"/><line x1="68" y1="26" x2="68" y2="74" stroke="#fff" stroke-opacity=".6" stroke-width="3" stroke-dasharray="5 5"/>'
+                '<polygon points="36,34 41,46 54,46 44,54 48,66 36,58 24,66 28,54 18,46 31,46" fill="#fff"/>')
+    elif shape == "crown":
+        body = f'<polygon points="8,76 14,26 36,50 50,14 64,50 86,26 92,76" fill="url(#g)" stroke="{b}" stroke-width="3" stroke-linejoin="round"/><rect x="8" y="80" width="84" height="11" rx="4" fill="{b}"/>'
+    else:
+        body = f'<circle cx="50" cy="50" r="44" fill="url(#g)"/><polygon points="16,48 86,20 74,82 52,64 40,78 38,58 74,30 30,54" fill="#fff"/>'
+    return f'<svg {_NS} viewBox="0 0 100 100">{_GRAD.format(a=a, b=b)}{body}</svg>'
+
+def art_svg(ref):
+    try:
+        if ref.startswith("art_h_") and ref[6:] in ART: return hero_svg(ref[6:])
+        if ref.startswith("art_p_") and ref[6:] in PK: return pk_svg(ref[6:])
+        if ref.startswith("art_b_") and ref[6:] in BANNERS: return banner_svg(ref[6:])
+        if ref[4:] in ART: return icon_svg(ref[4:])
+    except Exception: pass
+    return None
+
+# name, cat, slug, "ID maydoni", umumiy ikonka, [(nom, narx, guruh, belgi, ikonka)]
+CATALOG = [
+ ("PUBG Mobile", "game", "pubg", "Player ID", "uc", [(n, p, "UC", "", None) for n, p in
+   [("60 UC", 11700), ("325 UC", 59000), ("660 UC", 115000), ("1800 UC", 290000), ("3850 UC", 575000), ("8100 UC", 1165000)]]),
+ ("Free Fire", "game", "freefire", "Player ID", "gem", [(n, p, "Diamonds", "", None) for n, p in
+   [("110 Diamonds", 10500), ("341 Diamonds", 30800), ("572 Diamonds", 49800), ("1166 Diamonds", 99700), ("2398 Diamonds", 199000), ("6160 Diamonds", 505000)]] +
+   [(n, p, "Pacs", "", "pass") for n, p in [("Level Up Package 6", 4200), ("Level Up Package 10", 6800), ("Level Up Package 15", 6800), ("Level Up Package 20", 6800),
+   ("Level Up Package 25", 6800), ("Level Up Package 30", 9900), ("Weekly Lite", 5200), ("Weekly Membership", 20000), ("Monthly Membership", 74000)]]),
+ ("Mobile Legends", "game", "mlbb", "User ID + Zone ID", "gemb", [(n, p, "GL/uz", "2x", None) for n, p in
+   [("55 (50+5) Diamonds", 9800), ("165 (150+15) Diamonds", 29000), ("275 (250+25) Diamonds", 46500), ("565 (500+65) Diamonds", 96000)]] +
+   [("Haftalik Elite Pass", 11000, "GL/uz", "EP", "pass"), ("Diamonds Pass", 12000, "GL/uz", "PASS", "pass")]),
+ ("Honor of Kings", "game", "hok", "Player ID", "token", [(n, p, "Tokens", "", None) for n, p in
+   [("80 Tokens", 13000), ("400 Tokens", 65000), ("800 Tokens", 128000), ("2000 Tokens", 320000)]]),
+ ("Standoff 2", "game", "standoff2", "Player ID", "gold", [(n, p, "Gold", "", None) for n, p in
+   [("100 Gold", 13500), ("500 Gold", 65000), ("1000 Gold", 128000), ("2500 Gold", 315000), ("5000 Gold", 625000)]]),
+ ("Steam Top Up", "game", "steam", "Steam login", "gold", [(n, p, "Steam", "", None) for n, p in
+   [("Steam $5", 66000), ("Steam $10", 130000), ("Steam $20", 258000), ("Steam $50", 640000)]]),
+ ("Telegram Stars", "game", "stars", "Telegram @username", "star", [(n, p, "Stars", "", None) for n, p in
+   [("50 Stars", 11500), ("100 Stars", 22500), ("250 Stars", 56000), ("500 Stars", 110000), ("1000 Stars", 215000)]]),
+ ("Telegram Premium", "game", "premium", "Telegram @username", "crown", [(n, p, "Premium", "", None) for n, p in
+   [("3 oy", 175000), ("6 oy", 230000), ("12 oy", 410000)]]),
+ ("Bigo Live", "game", "bigo", "Bigo ID", "gemp", [(n, p, "Diamonds", "", None) for n, p in
+   [("50 Diamonds", 12000), ("100 Diamonds", 23500), ("500 Diamonds", 115000), ("1000 Diamonds", 228000)]]),
+ ("Clash of Clans", "game", "coc", "Player Tag (#...)", "gemg", [(n, p, "Gems", "", None) for n, p in
+   [("80 Gems", 13000), ("500 Gems", 65000), ("1200 Gems", 130000), ("2500 Gems", 260000)]] + [("Gold Pass", 65000, "Pass", "", "pass")]),
+ ("Brawl Stars", "game", "brawl", "Player Tag (#...)", "gemp", [(n, p, "Gems", "", None) for n, p in
+   [("30 Gems", 38000), ("80 Gems", 100000), ("170 Gems", 188000), ("360 Gems", 375000)]] + [("Brawl Pass", 125000, "Pass", "", "pass")]),
+ ("Clash Royale", "game", "royale", "Player Tag (#...)", "gemg", [(n, p, "Gems", "", None) for n, p in
+   [("80 Gems", 13000), ("500 Gems", 65000), ("1200 Gems", 130000), ("2500 Gems", 260000)]] + [("Pass Royale", 65000, "Pass", "", "pass")]),
+ ("Roblox Robux", "promo", "roblox", "Roblox username", "robux", [(n, p, "Robux", "", None) for n, p in
+   [("400 Robux", 65000), ("800 Robux", 128000), ("1700 Robux", 255000), ("4500 Robux", 640000)]]),
+ ("Discord Nitro", "promo", "discord", "Discord username / email", "crown", [(n, p, "Nitro", "", None) for n, p in
+   [("Nitro Basic 1 oy", 40000), ("Nitro 1 oy", 130000), ("Nitro 1 yil", 1250000)]]),
+]
+
+def seed_catalog():
+    if q1("select 1 x from settings where k='catalog_v3'"): return
+    for idx, (name, cat, slug, fld, pic, prods) in enumerate(CATALOG):
+        g = q1("select * from games where lower(name)=?", (name.lower(),))
+        if not g:
+            ex("insert into games(name,cat,sort) values(?,?,?)", (name, cat, idx)); g = q1("select * from games where lower(name)=?", (name.lower(),))
+        ex("update games set img=?,hero=?,picon=?,field=? where id=?",
+           (g["img"] or f"art_{slug}", g["hero"] or f"art_h_{slug}", g["picon"] or f"art_p_{pic}", fld if g["field"] in ("", "Player ID") else g["field"], g["id"]))
+        if not q1("select 1 x from products where game_id=?", (g["id"],)):
+            for pn, pr, grp, bd, kind in prods:
+                ex("insert into products(game_id,name,price,grp,badge,img) values(?,?,?,?,?,?)", (g["id"], pn, pr, grp, bd, f"art_p_{kind}" if kind else ""))
+    if not q1("select 1 x from banners"):
+        for n in BANNERS: ex("insert into banners(img,link) values(?,'')", (f"art_b_{n}",))
+    ss("catalog_v3", "1")
+
+def _ui():
+    try: return json.loads(gs("ui") or "{}")
+    except Exception: return {}
+
+def _days(d0):
+    out = []
+    for i in range(6, -1, -1):
+        a = d0 - 86400 * i; b = a + 86400
+        out.append({"d": datetime.utcfromtimestamp(a + 18000).strftime("%d.%m"),
+                    "u": q1("select count(*) c from users where joined>=? and joined<?", (a, b))["c"],
+                    "t": q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=? and created<?", (a, b))["s"],
+                    "o": q1("select count(*) c from orders where created>=? and created<?", (a, b))["c"]})
+    return out
+
+def apply_bot_profile():
+    """Bot profilidagi 'Description' (qisqa matn) va bo'sh chatdagi tavsifni Telegram'ga yozadi."""
+    try:
+        tg("setMyShortDescription", short_description=(gs("bot_about") or "")[:120])
+        tg("setMyDescription", description=(gs("bot_desc") or "")[:512])
+    except Exception as e:
+        log.warning("bot profile: %s", e)
+
 # ============================ WEB API ============================
 web = Flask(__name__)
 web.config['MAX_CONTENT_LENGTH'] = 14 * 1024 * 1024
@@ -184,6 +349,10 @@ _imgdir = "/tmp/syrexa_img"; os.makedirs(_imgdir, exist_ok=True)
 @web.route("/img/<fid>")
 def img(fid):
     if not re.fullmatch(r"[A-Za-z0-9_\-]+", fid): return "", 404
+    if fid.startswith("art_"):
+        svg = art_svg(fid)
+        if not svg: return "", 404
+        return Response(svg, mimetype="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
     if re.fullmatch(r"f\d+", fid):
         r = q1("select mime,data from files where id=?", (int(fid[1:]),))
         if not r: return "", 404
@@ -212,7 +381,7 @@ def api_init(u):
         banners=qa("select id,img,link from banners order by id"),
         games=qa("select id,name,cat,img from games where active=1 order by sort,id"),
         cfg={"support": gs("support_link"), "channel": gs("channel_link"), "min": int(gs("min_topup") or 1000),
-             "bot": gs("bot_name")}, sub=subs)
+             "bot": gs("bot_name"), "c1": gs("color1"), "c2": gs("color2"), "ui": _ui()}, sub=subs)
 
 @web.route("/api/game/<int:gid>")
 @need_user
@@ -357,7 +526,7 @@ def a_data(u, name):
         return jsonify(users=n["c"], bal=n["b"], new=q1("select count(*) c from users where joined>=?", (d0,))["c"],
                        top_sum=tp, top_today=tt, ord_cnt=od["c"], ord_sum=od["s"],
                        p_top=q1("select count(*) c from topups where status='pending'")["c"],
-                       p_ord=q1("select count(*) c from orders where status='pending'")["c"])
+                       p_ord=q1("select count(*) c from orders where status='pending'")["c"], days=_days(d0))
     if name == "games":
         return jsonify(games=qa("select g.*,(select count(*) from products where game_id=g.id) pc from games g order by sort,id"))
     if name == "game":
@@ -378,6 +547,7 @@ def a_data(u, name):
     if name == "chs": return jsonify(items=qa("select * from channels"))
     if name == "set": return jsonify(s={k: gs(k) for k in DEFAULTS})
     if name == "adms": return jsonify(items=all_admins(), owners=OWNERS)
+    if name == "texts": return jsonify(ok=1)
     if name == "bc": return jsonify(users=q1("select count(*) c from users where banned=0")["c"])
     return jsonify(err="nf"), 404
 
@@ -464,10 +634,24 @@ def a_import(u):
 @web.route("/api/a/set", methods=["POST"])
 @need_admin
 def a_set(u):
-    for k, v in (request.get_json(silent=True) or {}).items():
-        if k in DEFAULTS:
-            ss(k, re.sub(r"\D", "", str(v)) or DEFAULTS[k] if k in ("min_topup", "card_ttl") else str(v if v is not None else "").strip())
+    d = request.get_json(silent=True) or {}
+    for k, v in d.items():
+        if k in DEFAULTS and k != "ui":
+            v = "" if v is None else str(v).strip()
+            if k in ("min_topup", "card_ttl"): v = re.sub(r"\D", "", v) or DEFAULTS[k]
+            elif k in ("color1", "color2") and not re.fullmatch(r"#[0-9a-fA-F]{6}", v): v = DEFAULTS[k]
+            ss(k, v)
+    if "bot_about" in d or "bot_desc" in d: threading.Thread(target=apply_bot_profile, daemon=True).start()
     return jsonify(ok=True)
+
+@web.route("/api/a/text", methods=["POST"])
+@need_admin
+def a_text(u):
+    d = request.get_json(silent=True) or {}; k = str(d.get("k", ""))
+    if not re.fullmatch(r"\w+", k) or not str(d.get("uz", "")).strip() or not str(d.get("ru", "")).strip():
+        return jsonify(err="Ikkala tilda ham matn yozing"), 400
+    ui = _ui(); ui.setdefault("uz", {})[k] = str(d["uz"]).strip(); ui.setdefault("ru", {})[k] = str(d["ru"]).strip()
+    ss("ui", json.dumps(ui, ensure_ascii=False)); return jsonify(ok=True)
 
 @web.route("/api/a/user", methods=["POST"])
 @need_admin
@@ -555,7 +739,7 @@ def restore_from(path):
 
 def auto_restore():
     if not OWNERS: return
-    if q1("select count(*) c from users")["c"] or q1("select count(*) c from products")["c"]: return
+    if q1("select count(*) c from users")["c"] or q1("select count(*) c from orders")["c"]: return
     pm = tg("getChat", chat_id=OWNERS[0]).get("result", {}).get("pinned_message") or {}
     fid = (pm.get("document") or {}).get("file_id")
     if not fid: return
@@ -603,10 +787,10 @@ async def send_welcome(update: Update, ctx):
         return await ctx.bot.send_message(u.id, "Botdan foydalanish uchun kanallarga obuna bo'ling:",
                                           reply_markup=InlineKeyboardMarkup(rows))
     text = gs("welcome_ru" if row["lang"] == "ru" else "welcome_uz").replace("{name}", E(u.first_name or ""))
-    rows = [[InlineKeyboardButton("📱 Ilovani ochish", web_app=WebAppInfo(url=webapp_url()))]]
+    rows = [[InlineKeyboardButton(gs("btn_app"), web_app=WebAppInfo(url=webapp_url()))]]
     r2 = []
-    if link_ok(gs("channel_link")): r2.append(InlineKeyboardButton("Bizning kanal", url=gs("channel_link")))
-    if link_ok(gs("support_link")): r2.append(InlineKeyboardButton("Yordam", url=gs("support_link")))
+    if link_ok(gs("channel_link")): r2.append(InlineKeyboardButton(gs("btn_channel"), url=gs("channel_link")))
+    if link_ok(gs("support_link")): r2.append(InlineKeyboardButton(gs("btn_support"), url=gs("support_link")))
     if r2: rows.append(r2)
     kb = InlineKeyboardMarkup(rows)
     img = gs("welcome_img")
@@ -1091,6 +1275,7 @@ def main():
     try: auto_restore()
     except Exception as e: log.warning("auto_restore: %s", e)
     threading.Thread(target=backup_loop, daemon=True).start()
+    threading.Thread(target=apply_bot_profile, daemon=True).start()
     threading.Thread(target=lambda: web.run(host="0.0.0.0", port=PORT, use_reloader=False, threaded=True), daemon=True).start()
     if BASE_URL: threading.Thread(target=keepalive, daemon=True).start()
     app = Application.builder().token(TOKEN).post_init(post_init).build()
@@ -1195,8 +1380,8 @@ function go(tab,arg){S.tab=tab;S.arg=arg;clearInterval(S.tm);if(tab!='game')S.g=
 tg.BackButton.onClick(()=>back());
 function head(){const u=S.d.user;return `<div class="row" style="margin-bottom:12px"><div class="av">${esc((u.name||'?')[0])}</div><div><div class="mut sm">${t('hi')} 👋</div><b>${esc(u.name)}</b></div><div class="sp"></div>${S.d.user.admin?`<div class="ib" onclick="admGo('adm')">🛠</div>`:''}<div class="ib" onclick="setLang()">${S.lang.toUpperCase()}</div><div class="ib" onclick="setDark()">${S.dark?'☀️':'🌙'}</div></div>`}
 function balCard(){return `<div class="card bal"><div style="font-size:26px">💳</div><div class="sp"><div class="mut sm">${t('bal')}</div><b>${money(S.d.user.balance)}</b> <span class="mut sm">so'm</span></div><button class="btn sm" onclick="go('topup')">+ ${t('top')}</button></div>`}
-function nav(){const a=[['home','🏠',t('home')],['games','🎮',t('games')],['topup','👛',t('top')],['orders','🕘',t('orders')],['prof','👤',t('prof')]];
- return `<div class="nav">${a.map(x=>`<div class="${S.tab==x[0]?'on':''}" onclick="go('${x[0]}')"><i>${x[1]}</i>${x[2]}</div>`).join('')}</div>`}
+function nav(){const a=[['home','🏠',t('home')],['games','🎮',t('games')],['topup','👛',t('top')],['orders','🕘',t('orders')],['prof','👤',t('prof')]];if(S.d.user.admin)a.push(['adm','🛠','Admin']);
+ return `<div class="nav">${a.map(x=>`<div class="${S.tab==x[0]?'on':''}" onclick="${x[0]=='adm'?`admGo('adm')`:`go('${x[0]}')`}"><i>${x[1]}</i>${x[2]}</div>`).join('')}</div>`}
 function render(){const A=$('#app');const d=S.d;if(!d)return;if(S.tab.startsWith('adm')){A.innerHTML=vAdm();return}
  if(d.sub&&d.sub.length){A.innerHTML=`<div class="card" style="margin-top:40px;text-align:center"><div style="font-size:42px">📢</div><p>${t('sub')}</p>${d.sub.map(c=>`<button class="btn o" style="margin-bottom:8px" onclick="tg.openTelegramLink('${esc(c.link)}')">${esc(c.title)}</button>`).join('')}<button class="btn" onclick="boot()">${t('chk')}</button></div>`;return}
  let h='';const m=S.tab;
@@ -1247,11 +1432,11 @@ function ts(x){const d=new Date((x+18000)*1000);const p=n=>String(n).padStart(2,
 async function loadH(){if(S.hl)return;S.hl=1;try{S.h=await api('/api/history');const u=await api('/api/init');S.d.user=u.user;S.hl=0;if(S.tab=='orders')render()}catch(e){S.hl=0}}
 function vProf(){const u=S.d.user;return `<div class="card" style="text-align:center"><div class="av" style="margin:auto;width:70px;height:70px;font-size:30px">${esc((u.name||'?')[0])}</div><h3 style="margin:10px 0 2px">${esc(u.name)}</h3><div class="mut sm">${u.username?'@'+esc(u.username)+' · ':''}ID: ${u.id}</div></div>`+balCard()+
  `<div class="card"><b>🎟 ${t('promo')}</b><input id="pc" placeholder="${t('pr_in')}" style="margin:10px 0;text-transform:uppercase"><button class="btn" onclick="actPromo()">${t('act')}</button></div>
- <div class="card"><b>🌐 ${t('lang')}</b><div class="seg" style="margin:10px 0 0"><div class="${S.lang=='uz'?'on':''}" onclick="setLang('uz')">O'zbekcha</div><div class="${S.lang=='ru'?'on':''}" onclick="setLang('ru')">Русский</div></div></div>${u.admin?`<button class="btn" onclick="admGo('adm')">🛠 Admin panel</button>`:''}`}
+ <div class="card"><b>🌐 ${t('lang')}</b><div class="seg" style="margin:10px 0 0"><div class="${S.lang=='uz'?'on':''}" onclick="setLang('uz')">O'zbekcha</div><div class="${S.lang=='ru'?'on':''}" onclick="setLang('ru')">Русский</div></div></div>${u.admin?`<button class="btn" onclick="admGo('adm')">🛠 Admin panel</button>`:''}<div class="mut sm" style="text-align:center;margin-top:12px">Syrexa v4</div>`}
 async function actPromo(){const c=$('#pc').value.trim();if(!c)return;try{const r=await api('/api/promo',{code:c});S.d.user.balance=r.balance;toast('✅ +'+money(r.amount));render()}catch(e){toast(t('bad'))}}
 function setLang(l){S.lang=l||(S.lang=='uz'?'ru':'uz');localStorage.lang=S.lang;S.d.user.lang=S.lang;api('/api/lang',{lang:S.lang}).catch(()=>{});render()}
 function setDark(){S.dark=!S.dark;localStorage.dark=S.dark?'1':'0';document.body.classList.toggle('dk',S.dark);render()}
-async function boot(){try{S.d=await api('/api/init');if(!localStorage.lang)S.lang=S.d.user.lang||'uz';document.body.classList.toggle('dk',S.dark||(!localStorage.dark&&tg.colorScheme=='dark'));if(new URLSearchParams(location.search).get('admin')&&S.d.user.admin)admGo('adm');else render()}
+async function boot(){try{S.d=await api('/api/init');applyCfg();if(!localStorage.lang)S.lang=S.d.user.lang||'uz';document.body.classList.toggle('dk',S.dark||(!localStorage.dark&&tg.colorScheme=='dark'));if(new URLSearchParams(location.search).get('admin')&&S.d.user.admin)admGo('adm');else render()}
  catch(e){$('#app').innerHTML=`<div class="empty" style="margin-top:80px">${e.err=='maintenance'?'🛠 '+t('maint'):e.err=='banned'?'🚫':'Telegram ichida oching'}</div>`}}
 /* ===== ADMIN PANEL ===== */
 let F=null;
@@ -1261,16 +1446,16 @@ async function admGo(tab,arg){S.tab=tab;S.arg=arg;S.a=null;tg.BackButton.show();
  try{S.a=await api('/api/a/data/'+(tab.slice(4)||'home')+'?id='+(arg||'')+'&q='+encodeURIComponent(S.aq||''))}catch(e){toast((e&&e.err)||t('err'))}
  if(S.tab==tab)render()}
 const ah=(h,b)=>`<div class="hd"><h3>${h}</h3>${b||''}</div>`;
-const GF=[['name','Nomi','text'],['cat','Bo\'lim','sel',[['game','O\'yinlar'],['promo','Promokodlar bo\'limi']]],['img','Kichik ikonka (ro\'yxatdagi rasm)','img'],['hero','Katta banner (o\'yin sahifasi tepasi)','img'],['picon','Mahsulotlar uchun umumiy ikonka (UC, Diamonds rasmi)','img'],['field','Foydalanuvchi kiritadigan maydon (Player ID)','text'],['info','Info qator: matn | havola (ixtiyoriy)','text'],['active','Ko\'rinsinmi','tog']];
+const GF=[['name','Nomi','text'],['cat','Bo\'lim','sel',[['game','O\'yinlar'],['promo','Promokodlar bo\'limi']]],['img','Kichik ikonka (ro\'yxatdagi rasm)','img'],['hero','Katta banner (o\'yin sahifasi tepasi)','img'],['picon','Mahsulotlar uchun umumiy ikonka (UC, Diamonds rasmi)','img'],['field','Foydalanuvchi kiritadigan maydon (Player ID)','text'],['sort','Tartib raqami (kichigi birinchi)','number'],['info','Info qator: matn | havola (ixtiyoriy)','text'],['active','Ko\'rinsinmi','tog']];
 const PF=[['name','Nomi (masalan 60 UC)','text'],['price','Narxi (so\'m)','number'],['grp','Guruh / tab (UC, Prime, Diamonds, RU...)','text'],['badge','Belgi (2x, HIT...)','text'],['img','Rasm (bo\'sh bo\'lsa umumiy ikonka)','img'],['active','Ko\'rinsinmi','tog']];
 const CF=[['number','Karta raqami','text'],['holder','Karta egasi ismi','text'],['bank','Bank (UZCARD, HUMO)','text'],['active','Faol','tog']];
 const BF=[['img','Banner rasmi','img'],['link','Bosilganda ochiladigan havola (ixtiyoriy)','text']];
-const SF=[['bot_name','Bot nomi','text'],['welcome_uz','Salomlashuv matni (UZ) — {name} = ism','area'],['welcome_ru','Salomlashuv matni (RU)','area'],['welcome_img','Salomlashuv rasmi','img'],['support_link','Yordam havolasi (https://t.me/...)','text'],['channel_link','Kanal havolasi','text'],['min_topup','Minimal to\'ldirish (so\'m)','number'],['card_ttl','Karta amal qilish vaqti (daqiqa)','number'],['maintenance','Texnik ishlar rejimi','tog']];
+const SF=[['bot_name','Bot nomi','text'],['welcome_uz','Salomlashuv matni (UZ) — {name} = ism','area'],['welcome_ru','Salomlashuv matni (RU)','area'],['welcome_img','Salomlashuv rasmi','img'],['support_link','Yordam havolasi (https://t.me/...)','text'],['channel_link','Kanal havolasi','text'],['min_topup','Minimal to\'ldirish (so\'m)','number'],['card_ttl','Karta amal qilish vaqti (daqiqa)','number'],['color1','Asosiy rang (masalan #7c5cff)','text'],['color2','Ikkinchi rang (masalan #a78bfa)','text'],['btn_app','Botdagi tugma: ilovani ochish','text'],['btn_channel','Botdagi tugma: kanal','text'],['btn_support','Botdagi tugma: yordam','text'],['bot_about','Bot profilidagi qisqa matn (120 belgigacha)','area'],['bot_desc','Bot tavsifi (yangi foydalanuvchi ko\'radigan matn)','area'],['maintenance','Texnik ishlar rejimi','tog']];
 function vAdm(){const a=S.a;if(!a)return '<div class="empty">⏳</div>';
- return ({adm:aHome,adm_games:aGames,adm_game:aGame,adm_banners:aBanners,adm_cards:aCards,adm_users:aUsers,adm_tops:aTops,adm_ords:aOrds,adm_promos:aPromos,adm_chs:aChs,adm_set:aSet,adm_adms:aAdms,adm_bc:aBc}[S.tab]||aHome)(a)}
+ return ({adm:aHome,adm_games:aGames,adm_game:aGame,adm_banners:aBanners,adm_cards:aCards,adm_users:aUsers,adm_tops:aTops,adm_ords:aOrds,adm_promos:aPromos,adm_chs:aChs,adm_set:aSet,adm_adms:aAdms,adm_bc:aBc,adm_texts:aTexts}[S.tab]||aHome)(a)}
 function aHome(a){const c=(i,v,l)=>`<div class="card" style="margin:0"><div style="font-size:20px">${i}</div><b style="font-size:18px">${v}</b><div class="mut sm">${l}</div></div>`;
- const M=[['games','🎮','O\'yinlar va narxlar'],['banners','🖼','Bannerlar'],['tops','💰','To\'ldirishlar',a.p_top],['ords','📦','Buyurtmalar',a.p_ord],['users','👥','Foydalanuvchilar'],['cards','💳','Kartalar'],['promos','🎟','Promokodlar'],['chs','📢','Majburiy obuna'],['bc','📨','Xabar yuborish'],['set','⚙️','Sozlamalar'],['adms','👮','Adminlar']];
- return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div><div class="tl">${M.map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
+ const M=[['games','🎮','O\'yinlar va narxlar'],['banners','🖼','Bannerlar'],['tops','💰','To\'ldirishlar',a.p_top],['ords','📦','Buyurtmalar',a.p_ord],['users','👥','Foydalanuvchilar'],['cards','💳','Kartalar'],['promos','🎟','Promokodlar'],['chs','📢','Majburiy obuna'],['bc','📨','Xabar yuborish'],['texts','🔤','Ilova matnlari'],['set','⚙️','Sozlamalar'],['adms','👮','Adminlar']];
+ return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div>${days(a)}<div class="tl">${M.map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
 function aGames(a){return ah('🎮 O\'yinlar',`<button class="btn sm" onclick="newGame()">+ O'yin</button>`)+`<div class="mut sm" style="margin-bottom:12px">O'yinni bosing → rasm, nom va narxlarni o'zgartiring</div><div class="grid">${a.games.map(g=>`<div class="gc" onclick="admGo('adm_game',${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}<div class="mut" style="font-size:10px">${g.pc} ta${g.active?'':' · 🔴'}</div></div>`).join('')}</div>`}
 function aGame(a){const g=a.game;if(!g)return '<div class="empty">—</div>';const hi=g.hero||g.img;
  return ah(esc(g.name),`<button class="btn sm" onclick="editGame()">✏️ Tahrirlash</button>`)+`<div class="hero2" style="border-radius:18px;margin-bottom:12px;${hi?`background-image:url(/img/${hi})`:''}" onclick="editGame()"><div class="hs"></div><h2>${esc(g.name)}</h2><span class="ed">🖼 Rasmni o'zgartirish</span></div>
@@ -1304,6 +1489,10 @@ function editBc(){openForm('Xabar',[['text','Xabar matni (HTML mumkin: <b>qalin<
 function aAdms(a){return ah('👮 Adminlar',`<button class="btn sm" onclick="editAdm()">+ Admin</button>`)+a.items.map(i=>`<div class="li" ${a.owners.includes(i)?'':`onclick="delAdm(${i})"`}><div class="sp"><b>${i}</b><div class="mut sm">${a.owners.includes(i)?'Asosiy admin':'Bosing → olib tashlash'}</div></div></div>`).join('')}
 function editAdm(){openForm('Yangi admin',[['id','Telegram ID','number']],{},async v=>{await aj('admin',{id:v.id});await admGo('adm_adms')})}
 function delAdm(i){ask('Olib tashlansinmi?',async()=>{await aj('admin',{id:i,remove:1});admGo('adm_adms')})}
+function days(a){const mx=Math.max(1,...a.days.map(d=>d.t));return `<div class="card"><b>📈 So'nggi 7 kun</b>${a.days.map(d=>`<div class="row" style="margin-top:8px;font-size:12px"><span class="mut" style="width:42px">${d.d}</span><div class="bar sp" style="margin:0"><i style="width:${Math.round(d.t/mx*100)}%"></i></div><span style="width:128px;text-align:right">${money(d.t)} · 👤${d.u} · 📦${d.o}</span></div>`).join('')}</div>`}
+function aTexts(a){return ah('🔤 Ilova matnlari')+'<div class="mut sm" style="margin-bottom:10px">Matnni bosing — o\'zbekcha va ruscha variantini o\'zgartiring</div>'+Object.keys(T.uz).map(k=>`<div class="li" onclick="editText('${k}')"><div class="sp"><b>${esc(T.uz[k])}</b><div class="mut sm">${esc(T.ru[k]||'')}</div></div></div>`).join('')}
+function editText(k){openForm('Matn',[['uz','O\'zbekcha','area'],['ru','Ruscha','area']],{uz:T.uz[k],ru:T.ru[k]},async v=>{await aj('text',{k:k,uz:v.uz,ru:v.ru});T.uz[k]=v.uz;T.ru[k]=v.ru;await admGo('adm_texts')})}
+function applyCfg(){const c=S.d.cfg,ui=c.ui||{};['uz','ru'].forEach(l=>Object.assign(T[l],ui[l]||{}));if(c.c1)document.documentElement.style.setProperty('--p',c.c1);if(c.c2)document.documentElement.style.setProperty('--p2',c.c2)}
 /* --- forma oynasi --- */
 function openForm(title,fields,vals,save,extra){F={title:title,fields:fields,vals:Object.assign({},vals),save:save,extra:extra||{}};drawForm()}
 function Fs(k,v){F.vals[k]=v}
