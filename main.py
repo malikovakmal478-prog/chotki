@@ -27,7 +27,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("syrexa")
 
 TOKEN = os.getenv("BOT_TOKEN", "")
-OWNERS = [int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS", ""))]
+OWNERS = list(dict.fromkeys(int(x) for n in ("ADMIN_IDS", "ADMINS", "ADMIN_ID", "ADMIN") for x in re.findall(r"\d+", os.getenv(n, ""))))
 BASE_URL = (os.getenv("WEBAPP_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 DB_PATH = os.getenv("DB_PATH", "syrexa.db")
@@ -997,13 +997,36 @@ async def ask(update, ctx, st, text):
     ctx.user_data["st"] = st
     await show(update, (text + "\n\n<i>Bekor qilish: /cancel</i>", [[("🔙 Bekor", "a:home")]]))
 
+VERSION = "v4"
+
+async def cmd_version(update, ctx):
+    u = update.effective_user
+    await update.message.reply_text(f"Syrexa {VERSION}\nSizning ID: {u.id}\nAdmin: {'ha' if is_admin(u.id) else 'yoq'}\nIlova manzili: {webapp_url()}")
+
 async def cmd_admin(update, ctx):
-    if not is_admin(update.effective_user.id): return
+    u = update.effective_user
+    if not is_admin(u.id):
+        return await update.message.reply_text(f"⛔ Siz admin emassiz.\nSizning ID: {u.id}\nRender → Environment → ADMIN_IDS ga shu raqamni yozing.")
     ctx.user_data.pop("st", None)
-    rows = [[InlineKeyboardButton("🛠 Admin panelni ochish", web_app=WebAppInfo(url=webapp_url() + "?admin=1"))],
-            [InlineKeyboardButton("💬 Chat ichidagi panel", callback_data="a:home")]]
-    await update.message.reply_text("🛠 <b>SYREXA Admin</b>\nRasm, narx, karta — hammasini qulay panelda o'zgartiring:",
-                                    reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML")
+    txt = "🛠 <b>SYREXA Admin</b>\nRasm, narx, karta — hammasini qulay panelda o'zgartiring:"
+    chat_btn = [InlineKeyboardButton("💬 Chat ichidagi panel", callback_data="a:home")]
+    err = None
+    for url in (webapp_url() + "?admin=1", webapp_url()):
+        try:
+            return await update.message.reply_text(txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🛠 Admin panelni ochish", web_app=WebAppInfo(url=url))], chat_btn]))
+        except Exception as e:
+            err = e; log.warning("cmd_admin webapp url=%s: %s", url, e)
+    await update.message.reply_text(f"{txt}\n\n⚠️ Mini App tugmasi ochilmadi: {E(str(err))}\nWEBAPP_URL / RENDER_EXTERNAL_URL tekshiring.",
+                                    parse_mode="HTML", reply_markup=InlineKeyboardMarkup([chat_btn]))
+
+_last_err = {"t": 0}
+async def on_error(update, ctx):
+    log.error("handler xatosi", exc_info=ctx.error)
+    if OWNERS and time.time() - _last_err["t"] > 60:
+        _last_err["t"] = time.time()
+        try: await ctx.bot.send_message(OWNERS[0], f"⚠️ Bot xatosi: {E(repr(ctx.error)[:500])}")
+        except Exception: pass
 
 async def cmd_cancel(update, ctx):
     ctx.user_data.pop("st", None)
@@ -1283,14 +1306,17 @@ def main():
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("version", cmd_version))
+    app.add_error_handler(on_error)
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_doc))
     app.add_handler(CallbackQueryHandler(cb_chk, pattern="^chk$"))
     app.add_handler(CallbackQueryHandler(adm_cb, pattern="^a:"))
     app.add_handler(CallbackQueryHandler(cb_decide, pattern="^[to]:"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_msg))
+    if not OWNERS: log.warning("ADMIN_IDS (yoki ADMINS) kiritilmagan - hech kim admin emas!")
     log.info("Syrexa ishga tushdi. Admins: %s", all_admins())
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 # ============================ MINI APP (frontend) ============================
 INDEX = r"""<!DOCTYPE html><html lang="uz"><head><meta charset="utf-8">
