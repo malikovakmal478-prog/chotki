@@ -809,7 +809,9 @@ def restore_from(path):
     src.close(); init_db()
 
 def _tg_backup_file():
-    pm = tg("getChat", chat_id=OWNERS[0]).get("result", {}).get("pinned_message") or {}
+    r = tg("getChat", chat_id=OWNERS[0])
+    if not r.get("ok"): raise RuntimeError("getChat: " + str(r.get("description", "javob yo'q")))
+    pm = r.get("result", {}).get("pinned_message") or {}
     fid = (pm.get("document") or {}).get("file_id")
     if not fid: return None
     fp = tg("getFile", file_id=fid).get("result", {}).get("file_path")
@@ -1402,6 +1404,12 @@ def keepalive():
 
 def main():
     if not TOKEN: raise SystemExit("BOT_TOKEN kiritilmagan!")
+    for _try in range(3):
+        me = tg("getMe")
+        if me.get("ok"): break
+        if me.get("error_code") == 401:
+            raise SystemExit("BOT_TOKEN NOTO'G'RI yoki BEKOR QILINGAN. BotFather -> /mybots -> botingiz -> API Token dan yangisini oling va Render -> Environment -> BOT_TOKEN ni yangilang.")
+        time.sleep(3)
     init_db()
     try: auto_restore()
     except Exception as e: log.warning("auto_restore: %s", e)
