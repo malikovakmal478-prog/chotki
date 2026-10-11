@@ -733,61 +733,145 @@ def a_broadcast(u):
     return jsonify(ok=True)
 
 # ============================ ZAXIRA (Render bepul rejasi bazani o'chirmasligi uchun) ============================
-_last_bak = {"id": None}
-def backup_now():
-    if not OWNERS: return
+# 1) Telegram: pin qilingan fayl (oxirgi 12 ta nusxa saqlanadi)
+# 2) Ixtiyoriy GitHub (Render Environment: GH_TOKEN va GH_REPO=foydalanuvchi/repo) - har nusxa git tarixida qoladi.
+_bak = {"failed": False, "last": 0}
+GH_TOKEN = os.getenv("GH_TOKEN", ""); GH_REPO = os.getenv("GH_REPO", "")
+KEEP_BACKUPS = 12
+
+def db_stats():
+    return {k: q1(f"select count(*) c from {t}")["c"] for k, t in
+            (("users", "users"), ("orders", "orders"), ("topups", "topups"), ("products", "products"), ("games", "games"))}
+
+def db_is_fresh():
+    st = db_stats()
+    return st["users"] == 0 and st["orders"] == 0 and st["topups"] == 0
+
+def _gh_headers(raw=False):
+    return {"Authorization": f"Bearer {GH_TOKEN}", "User-Agent": "syrexa",
+            "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json"}
+
+def gh_push(path):
+    if not (GH_TOKEN and GH_REPO): return
+    try:
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/syrexa_backup.db"
+        r = requests.get(url, headers=_gh_headers(), timeout=60)
+        body = {"message": "backup " + ts(time.time()), "content": base64.b64encode(open(path, "rb").read()).decode()}
+        if r.status_code == 200 and r.json().get("sha"): body["sha"] = r.json()["sha"]
+        r = requests.put(url, headers=_gh_headers(), json=body, timeout=120)
+        if r.status_code not in (200, 201): log.warning("GitHub zaxira: %s %s", r.status_code, r.text[:200])
+    except Exception as e:
+        log.warning("GitHub zaxira xatosi: %s", e)
+
+def gh_pull(dest):
+    if not (GH_TOKEN and GH_REPO): return False
+    try:
+        r = requests.get(f"https://api.github.com/repos/{GH_REPO}/contents/syrexa_backup.db", headers=_gh_headers(True), timeout=120)
+        if r.status_code != 200 or len(r.content) < 1000: return False
+        open(dest, "wb").write(r.content); return True
+    except Exception as e:
+        log.warning("GitHub tiklash xatosi: %s", e); return False
+
+def backup_now(force=False):
+    if not OWNERS: return "OWNERS yo'q"
+    if not force:
+        if _bak["failed"]: log.warning("Zaxira to'xtatilgan: baza tiklanmagan (/restore yoki /backup)"); return "failed"
+        if db_is_fresh(): return "fresh"
     try:
         tmp = "/tmp/syrexa_backup.db"
         if os.path.exists(tmp): os.remove(tmp)
         dst = sqlite3.connect(tmp)
         with _lock: db.backup(dst)
         dst.close()
+        st = db_stats()
+        cap = f"💾 Syrexa zaxira {ts(time.time())}\n👥 {st['users']} · 📦 {st['orders']} · 💰 {st['topups']} · 🛍 {st['products']}"
         with open(tmp, "rb") as f:
-            r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument", data={"chat_id": OWNERS[0], "caption": "💾 Syrexa zaxira nusxa " + ts(time.time())},
+            r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument", data={"chat_id": OWNERS[0], "caption": cap},
                               files={"document": ("syrexa_backup.db", f)}, timeout=120).json()
+        res = "ok" if r.get("ok") else "telegram xato"
         if r.get("ok"):
             mid = r["result"]["message_id"]
             tg("pinChatMessage", chat_id=OWNERS[0], message_id=mid, disable_notification=True)
-            if _last_bak["id"]: tg("deleteMessage", chat_id=OWNERS[0], message_id=_last_bak["id"])
-            _last_bak["id"] = mid
+            try: ids = json.loads(gs("bak_ids") or "[]")
+            except Exception: ids = []
+            ids.append(mid)
+            while len(ids) > KEEP_BACKUPS: tg("deleteMessage", chat_id=OWNERS[0], message_id=ids.pop(0))
+            ss("bak_ids", json.dumps(ids))
+        gh_push(tmp)
+        _bak["last"] = time.time()
+        return res
     except Exception as e:
-        log.warning("backup: %s", e)
+        log.warning("backup: %s", e); return f"xato: {e}"
 
 def restore_from(path):
     src = sqlite3.connect(path); src.execute("select count(*) from games")
     with _lock: src.backup(db)
     src.close(); init_db()
 
-def auto_restore():
-    if not OWNERS: return
-    if q1("select count(*) c from users")["c"] or q1("select count(*) c from orders")["c"]: return
+def _tg_backup_file():
     pm = tg("getChat", chat_id=OWNERS[0]).get("result", {}).get("pinned_message") or {}
     fid = (pm.get("document") or {}).get("file_id")
-    if not fid: return
+    if not fid: return None
     fp = tg("getFile", file_id=fid).get("result", {}).get("file_path")
-    if not fp: return
-    open("/tmp/restore.db", "wb").write(requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", timeout=120).content)
-    restore_from("/tmp/restore.db"); _last_bak["id"] = pm.get("message_id")
-    log.info("Baza zaxiradan tiklandi")
+    if not fp: raise RuntimeError("getFile javob bermadi")
+    data = requests.get(f"https://api.telegram.org/file/bot{TOKEN}/{fp}", timeout=120).content
+    if len(data) < 1000: raise RuntimeError("fayl bo'sh")
+    open("/tmp/restore.db", "wb").write(data); return "/tmp/restore.db"
+
+def auto_restore():
+    if not OWNERS or not db_is_fresh(): return
+    errs = []
+    for _ in range(3):
+        try:
+            src = _tg_backup_file()
+            if src:
+                restore_from(src); log.info("Baza Telegram zaxirasidan tiklandi"); return
+            break
+        except Exception as e:
+            errs.append(repr(e)); time.sleep(3)
+    if gh_pull("/tmp/restore_gh.db"):
+        try:
+            restore_from("/tmp/restore_gh.db"); log.info("Baza GitHub zaxirasidan tiklandi"); return
+        except Exception as e:
+            errs.append("gh: " + repr(e))
+    if errs:
+        _bak["failed"] = True
+        msg = f"⚠️ Baza zaxiradan TIKLANMADI: {E(errs[-1][:200])}\nAvtomatik zaxira TO'XTATILDI (eski nusxalar o'chmasligi uchun).\nChatdagi eng so'nggi syrexa_backup.db faylini botga «/restore» izohi bilan yuboring."
+    else:
+        msg = "ℹ️ Zaxira fayli topilmadi, yangi baza boshlandi.\nAgar oldin ma'lumot bo'lgan bo'lsa, chatdagi eng so'nggi syrexa_backup.db faylini botga «/restore» izohi bilan yuboring."
+    log.warning(msg.replace("\n", " "))
+    for a in OWNERS[:1]: notify(a, msg)
 
 def backup_loop():
     last = db.total_changes; lastt = 0
     while True:
-        time.sleep(120)
-        if db.total_changes != last and time.time() - lastt > 240:
+        time.sleep(90)
+        if db.total_changes != last and time.time() - lastt > 300:
             last = db.total_changes; lastt = time.time(); backup_now()
 
 async def cmd_backup(update, ctx):
     if is_admin(update.effective_user.id):
         await update.message.reply_text("⏳ Zaxira nusxa yuborilmoqda...")
-        await asyncio.to_thread(backup_now)
+        r = await asyncio.to_thread(backup_now, True)
+        await update.message.reply_text("✅ Yuborildi" if r == "ok" else f"⚠️ {r}")
+
+async def cmd_dbinfo(update, ctx):
+    if not is_admin(update.effective_user.id): return
+    st = db_stats()
+    await update.message.reply_text(
+        f"📊 Baza: 👥 {st['users']} · 📦 {st['orders']} · 💰 {st['topups']} · 🎮 {st['games']} · 🛍 {st['products']}\n"
+        f"Avtomatik zaxira: {'⛔ TO`XTATILGAN (baza tiklanmagan)' if _bak['failed'] else 'faol'}\n"
+        f"Oxirgi zaxira: {ts(_bak['last']) if _bak['last'] else 'bu ishga tushishda hali yo`q'}\n"
+        f"GitHub zaxira: {'yoqilgan' if GH_TOKEN and GH_REPO else 'yoqilmagan'}")
 
 async def on_doc(update, ctx):
     u = update.effective_user; m = update.message
     if not u or not is_admin(u.id) or not m.document or "/restore" not in (m.caption or ""): return
     f = await m.document.get_file(); await f.download_to_drive("/tmp/restore.db")
     try:
-        restore_from("/tmp/restore.db"); await m.reply_text("✅ Baza tiklandi")
+        restore_from("/tmp/restore.db"); _bak["failed"] = False
+        await m.reply_text("✅ Baza tiklandi. Mini App'ni yopib qayta oching.")
+        await asyncio.to_thread(backup_now, True)
     except Exception as e:
         await m.reply_text(f"❌ Xato: {e}")
 
@@ -1043,6 +1127,9 @@ async def cmd_admin(update, ctx):
 
 _last_err = {"t": 0}
 async def on_error(update, ctx):
+    from telegram.error import Conflict, NetworkError
+    if isinstance(ctx.error, (Conflict, NetworkError)):
+        return log.warning("Telegram: %s (qayta ulanadi, deploy paytida oddiy holat)", type(ctx.error).__name__)
     log.error("handler xatosi", exc_info=ctx.error)
     if OWNERS and time.time() - _last_err["t"] > 60:
         _last_err["t"] = time.time()
@@ -1328,6 +1415,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("version", cmd_version))
+    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))
     app.add_error_handler(on_error)
     app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, on_doc))
     app.add_handler(CallbackQueryHandler(cb_chk, pattern="^chk$"))
