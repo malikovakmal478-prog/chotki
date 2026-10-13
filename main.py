@@ -13,7 +13,7 @@ requirements.txt:
   requests==2.32.3
 Start command:  python main.py
 """
-import os, re, json, base64, time, hmac, html, random, sqlite3, hashlib, asyncio, logging, threading, functools, urllib.parse
+import contextvars, os, re, json, base64, time, hmac, html, random, sqlite3, hashlib, asyncio, logging, threading, functools, urllib.parse
 from datetime import datetime
 import requests
 from flask import Flask, request, jsonify, Response
@@ -95,6 +95,17 @@ def gs(k):
     return r["v"] if r else DEFAULTS.get(k, "")
 def ss(k, v):
     ex("insert into settings(k,v) values(?,?) on conflict(k) do update set v=excluded.v", (k, str(v)))
+
+# Bosh admin: ADMINS ro'yxatidagi birinchi ID (yoki MAIN_ADMIN). Boshqa adminlarga umuman ko'rinmaydi.
+MAIN = int((os.getenv("MAIN_ADMIN") or "0").strip() or 0) or (OWNERS[0] if OWNERS else 0)
+_viewer = contextvars.ContextVar("viewer", default=0)
+def is_main(uid): return bool(MAIN) and uid == MAIN
+def hid(viewer=None):
+    """Shu ko'ruvchidan yashirilishi kerak bo'lgan ID (bosh admin). Ko'ruvchi bosh admin bo'lsa 0."""
+    v = _viewer.get() if viewer is None else viewer
+    return 0 if v == MAIN else MAIN
+def notify_targets(uid):
+    return [MAIN] if is_main(uid) else all_admins()
 
 def all_admins():
     return list(dict.fromkeys(OWNERS + [r["id"] for r in qa("select id from admins")]))
@@ -289,14 +300,14 @@ def _ui():
     try: return json.loads(gs("ui") or "{}")
     except Exception: return {}
 
-def _days(d0):
+def _days(d0, h=0):
     out = []
     for i in range(6, -1, -1):
         a = d0 - 86400 * i; b = a + 86400
         out.append({"d": datetime.utcfromtimestamp(a + 18000).strftime("%d.%m"),
-                    "u": q1("select count(*) c from users where joined>=? and joined<?", (a, b))["c"],
-                    "t": q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=? and created<?", (a, b))["s"],
-                    "o": q1("select count(*) c from orders where created>=? and created<?", (a, b))["c"]})
+                    "u": q1("select count(*) c from users where joined>=? and joined<? and id!=?", (a, b, h))["c"],
+                    "t": q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=? and created<? and uid!=?", (a, b, h))["s"],
+                    "o": q1("select count(*) c from orders where created>=? and created<? and uid!=?", (a, b, h))["c"]})
     return out
 
 def apply_bot_profile():
@@ -419,7 +430,7 @@ def api_order(u):
                  (u["id"], p["gname"], p["name"], p["price"], player, int(time.time()))).lastrowid
     txt = (f"🛒 <b>Yangi buyurtma #{oid}</b>\n👤 {ulink(u)}\n🎮 {E(p['gname'])} — {E(p['name'])}\n"
            f"🆔 ID: <code>{E(player)}</code>\n💰 {money(p['price'])} so'm")
-    for a in all_admins(): tg("sendMessage", chat_id=a, text=txt, parse_mode="HTML", reply_markup=order_kb(oid))
+    for a in notify_targets(u["id"]): tg("sendMessage", chat_id=a, text=txt, parse_mode="HTML", reply_markup=order_kb(oid))
     return jsonify(ok=True, id=oid, balance=q1("select balance from users where id=?", (u["id"],))["balance"])
 
 @web.route("/api/topup", methods=["POST"])
@@ -448,7 +459,7 @@ def api_paid(u, tid):
     txt = (f"💳 <b>To'ldirish so'rovi #{tid}</b>\n👤 {ulink(u)}\n💰 <b>{money(t['amount'])}</b> so'm\n"
            f"🏦 Karta: <code>{E(cd.get('number',''))}</code> ({E(cd.get('holder',''))})\n🕒 {ts(t['created'])}\n\n"
            f"Pul kartaga tushganini tekshiring, so'ng tasdiqlang.")
-    for a in all_admins(): tg("sendMessage", chat_id=a, text=txt, parse_mode="HTML", reply_markup=topup_kb(tid))
+    for a in notify_targets(u["id"]): tg("sendMessage", chat_id=a, text=txt, parse_mode="HTML", reply_markup=topup_kb(tid))
     return jsonify(ok=True)
 
 @web.route("/api/history")
@@ -527,16 +538,17 @@ def decide_order(oid, ok):
 @need_admin
 def a_data(u, name):
     gid = request.args.get("id", type=int); s = request.args.get("q", "").strip()
+    h = 0 if is_main(u["id"]) else MAIN
     if name == "home":
         d0 = (int(time.time()) + 18000) // 86400 * 86400 - 18000
-        n = q1("select count(*) c, coalesce(sum(balance),0) b from users")
-        tp = q1("select coalesce(sum(amount),0) s from topups where status='approved'")["s"]
-        tt = q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=?", (d0,))["s"]
-        od = q1("select count(*) c, coalesce(sum(price),0) s from orders where status='done'")
-        return jsonify(users=n["c"], bal=n["b"], new=q1("select count(*) c from users where joined>=?", (d0,))["c"],
-                       top_sum=tp, top_today=tt, ord_cnt=od["c"], ord_sum=od["s"],
-                       p_top=q1("select count(*) c from topups where status='pending'")["c"],
-                       p_ord=q1("select count(*) c from orders where status='pending'")["c"], days=_days(d0))
+        n = q1("select count(*) c, coalesce(sum(balance),0) b from users where id!=?", (h,))
+        tp = q1("select coalesce(sum(amount),0) s from topups where status='approved' and uid!=?", (h,))["s"]
+        tt = q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=? and uid!=?", (d0, h))["s"]
+        od = q1("select count(*) c, coalesce(sum(price),0) s from orders where status='done' and uid!=?", (h,))
+        return jsonify(users=n["c"], bal=n["b"], new=q1("select count(*) c from users where joined>=? and id!=?", (d0, h))["c"],
+                       top_sum=tp, top_today=tt, ord_cnt=od["c"], ord_sum=od["s"], main=is_main(u["id"]),
+                       p_top=q1("select count(*) c from topups where status='pending' and uid!=?", (h,))["c"],
+                       p_ord=q1("select count(*) c from orders where status='pending' and uid!=?", (h,))["c"], days=_days(d0, h))
     if name == "games":
         return jsonify(games=qa("select g.*,(select count(*) from products where game_id=g.id) pc from games g order by sort,id"))
     if name == "game":
@@ -545,20 +557,20 @@ def a_data(u, name):
     if name == "banners": return jsonify(items=qa("select * from banners order by id"))
     if name == "cards": return jsonify(items=qa("select * from cards order by id"))
     if name == "users":
-        if s.isdigit(): rows = qa("select * from users where id=? or name like ? limit 30", (int(s), f"%{s}%"))
-        elif s: rows = qa("select * from users where name like ? or username like ? limit 30", (f"%{s}%", f"%{s.lstrip('@')}%"))
-        else: rows = qa("select * from users order by id desc limit 30")
+        if s.isdigit(): rows = qa("select * from users where (id=? or name like ?) and id!=? limit 30", (int(s), f"%{s}%", h))
+        elif s: rows = qa("select * from users where (name like ? or username like ?) and id!=? limit 30", (f"%{s}%", f"%{s.lstrip('@')}%", h))
+        else: rows = qa("select * from users where id!=? order by id desc limit 30", (h,))
         return jsonify(items=rows)
     if name == "tops":
-        return jsonify(items=qa("select t.*,u.name uname from topups t left join users u on u.id=t.uid where t.status!='new' order by (t.status='pending') desc, t.id desc limit 40"))
+        return jsonify(items=qa("select t.*,u.name uname from topups t left join users u on u.id=t.uid where t.status!='new' and t.uid!=? order by (t.status='pending') desc, t.id desc limit 40", (h,)))
     if name == "ords":
-        return jsonify(items=qa("select o.*,u.name uname from orders o left join users u on u.id=o.uid order by (o.status='pending') desc, o.id desc limit 40"))
+        return jsonify(items=qa("select o.*,u.name uname from orders o left join users u on u.id=o.uid where o.uid!=? order by (o.status='pending') desc, o.id desc limit 40", (h,)))
     if name == "promos": return jsonify(items=qa("select * from promos"))
     if name == "chs": return jsonify(items=qa("select * from channels"))
     if name == "set": return jsonify(s={k: gs(k) for k in DEFAULTS})
-    if name == "adms": return jsonify(items=all_admins(), owners=OWNERS)
+    if name == "adms": return jsonify(items=[i for i in all_admins() if i != h], owners=[i for i in OWNERS if i != h], main=is_main(u["id"]))
     if name == "texts": return jsonify(ok=1)
-    if name == "bc": return jsonify(users=q1("select count(*) c from users where banned=0")["c"])
+    if name == "bc": return jsonify(users=q1("select count(*) c from users where banned=0 and id!=?", (h,))["c"])
     return jsonify(err="nf"), 404
 
 @web.route("/api/a/save/<t>", methods=["POST"])
@@ -678,6 +690,7 @@ def a_text(u):
 @need_admin
 def a_user(u):
     d = request.get_json(silent=True) or {}; uid = int(d["id"]); amt = _i(d.get("amt"))
+    if uid == hid(u["id"]): return jsonify(err="Topilmadi"), 404
     if amt > 0:
         ex("update users set balance=max(0,balance+?) where id=?", (amt if d.get("op") == "add" else -amt, uid))
         notify(uid, f"{'➕' if d.get('op') == 'add' else '➖'} Balansingiz o'zgardi: <b>{money(amt)}</b> so'm")
@@ -687,16 +700,21 @@ def a_user(u):
 @web.route("/api/a/topup", methods=["POST"])
 @need_admin
 def a_topup(u):
-    d = request.get_json(silent=True) or {}; return jsonify(msg=decide_topup(int(d["id"]), _i(d.get("ok"))))
+    d = request.get_json(silent=True) or {}; r = q1("select uid from topups where id=?", (int(d["id"]),))
+    if r and r["uid"] == hid(u["id"]): return jsonify(msg="Topilmadi")
+    return jsonify(msg=decide_topup(int(d["id"]), _i(d.get("ok"))))
 
 @web.route("/api/a/order", methods=["POST"])
 @need_admin
 def a_order(u):
-    d = request.get_json(silent=True) or {}; return jsonify(msg=decide_order(int(d["id"]), _i(d.get("ok"))))
+    d = request.get_json(silent=True) or {}; r = q1("select uid from orders where id=?", (int(d["id"]),))
+    if r and r["uid"] == hid(u["id"]): return jsonify(msg="Topilmadi")
+    return jsonify(msg=decide_order(int(d["id"]), _i(d.get("ok"))))
 
 @web.route("/api/a/admin", methods=["POST"])
 @need_admin
 def a_admin(u):
+    if not is_main(u["id"]): return jsonify(err="Faqat bosh admin adminlarni boshqara oladi"), 403
     d = request.get_json(silent=True) or {}; i = _i(d.get("id"))
     if not i: return jsonify(err="ID kiriting"), 400
     if d.get("remove"):
@@ -852,13 +870,13 @@ def backup_loop():
             last = db.total_changes; lastt = time.time(); backup_now()
 
 async def cmd_backup(update, ctx):
-    if is_admin(update.effective_user.id):
+    if is_main(update.effective_user.id):
         await update.message.reply_text("⏳ Zaxira nusxa yuborilmoqda...")
         r = await asyncio.to_thread(backup_now, True)
         await update.message.reply_text("✅ Yuborildi" if r == "ok" else f"⚠️ {r}")
 
 async def cmd_dbinfo(update, ctx):
-    if not is_admin(update.effective_user.id): return
+    if not is_main(update.effective_user.id): return
     st = db_stats()
     await update.message.reply_text(
         f"📊 Baza: 👥 {st['users']} · 📦 {st['orders']} · 💰 {st['topups']} · 🎮 {st['games']} · 🛍 {st['products']}\n"
@@ -868,7 +886,7 @@ async def cmd_dbinfo(update, ctx):
 
 async def on_doc(update, ctx):
     u = update.effective_user; m = update.message
-    if not u or not is_admin(u.id) or not m.document or "/restore" not in (m.caption or ""): return
+    if not u or not is_main(u.id) or not m.document or "/restore" not in (m.caption or ""): return
     f = await m.document.get_file(); await f.download_to_drive("/tmp/restore.db")
     try:
         restore_from("/tmp/restore.db"); _bak["failed"] = False
@@ -953,14 +971,14 @@ def v_home():
         [("⚙️ Sozlamalar", "a:set"), ("👮 Adminlar", "a:adms")]])
 
 def v_stat():
-    d0 = (int(time.time()) + 18000) // 86400 * 86400 - 18000
-    n = q1("select count(*) c, coalesce(sum(balance),0) b from users")
-    new = q1("select count(*) c from users where joined>=?", (d0,))["c"]
-    tp = q1("select count(*) c, coalesce(sum(amount),0) s from topups where status='approved'")
-    tpt = q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=?", (d0,))["s"]
-    od = q1("select count(*) c, coalesce(sum(price),0) s from orders where status='done'")
-    odp = q1("select count(*) c from orders where status='pending'")["c"]
-    tpp = q1("select count(*) c from topups where status='pending'")["c"]
+    d0 = (int(time.time()) + 18000) // 86400 * 86400 - 18000; h = hid()
+    n = q1("select count(*) c, coalesce(sum(balance),0) b from users where id!=?", (h,))
+    new = q1("select count(*) c from users where joined>=? and id!=?", (d0, h))["c"]
+    tp = q1("select count(*) c, coalesce(sum(amount),0) s from topups where status='approved' and uid!=?", (h,))
+    tpt = q1("select coalesce(sum(amount),0) s from topups where status='approved' and created>=? and uid!=?", (d0, h))["s"]
+    od = q1("select count(*) c, coalesce(sum(price),0) s from orders where status='done' and uid!=?", (h,))
+    odp = q1("select count(*) c from orders where status='pending' and uid!=?", (h,))["c"]
+    tpp = q1("select count(*) c from topups where status='pending' and uid!=?", (h,))["c"]
     txt = (f"📊 <b>Statistika</b>\n\n👥 Foydalanuvchilar: <b>{n['c']}</b> (bugun +{new})\n💼 Umumiy balans: <b>{money(n['b'])}</b> so'm\n\n"
            f"💰 To'ldirilgan: <b>{money(tp['s'])}</b> so'm ({tp['c']} ta)\n📅 Bugun: <b>{money(tpt)}</b> so'm\n\n"
            f"📦 Bajarilgan buyurtmalar: <b>{od['c']}</b> ta — {money(od['s'])} so'm\n"
@@ -968,7 +986,7 @@ def v_stat():
     return txt, [[("🔄 Yangilash", "a:stat")], BACK]
 
 def v_users():
-    top = qa("select * from users order by id desc limit 8")
+    top = qa("select * from users where id!=? order by id desc limit 8", (hid(),))
     rows = [[("🔎 Qidirish (ID / @username)", "a:find")]]
     for u in top: rows.append([(f"{'🚫 ' if u['banned'] else ''}{u['name'][:22]} · {money(u['balance'])}", f"a:u:{u['id']}")])
     rows.append(BACK)
@@ -976,7 +994,7 @@ def v_users():
 
 def v_user(uid):
     u = q1("select * from users where id=?", (uid,))
-    if not u: return "Topilmadi", [BACK]
+    if not u or uid == hid(): return "Topilmadi", [BACK]
     oc = q1("select count(*) c from orders where uid=?", (uid,))["c"]
     txt = (f"👤 {ulink(u)}\n@{E(u['username'] or '-')}\n💰 Balans: <b>{money(u['balance'])}</b> so'm\n"
            f"📦 Buyurtmalar: {oc}\n🌐 Til: {u['lang']}\n📅 {ts(u['joined'] or 0)}\n{'🚫 BLOKLANGAN' if u['banned'] else ''}")
@@ -1039,28 +1057,28 @@ def v_card(cid):
              [("👁 Yoqish/O'chirish", f"a:ctog:{cid}"), ("🗑 O'chirish", f"a:cdel:{cid}")], [("🔙 Kartalar", "a:cards")]])
 
 def v_tops():
-    ts_ = qa("select * from topups where status='pending' order by id desc limit 15")
+    ts_ = qa("select * from topups where status='pending' and uid!=? order by id desc limit 15", (hid(),))
     rows = [[(f"#{t['id']} · {money(t['amount'])} · {ts(t['created'])}", f"a:t:{t['id']}")] for t in ts_]
     rows.append(BACK)
     return f"💰 <b>Kutilayotgan to'ldirishlar</b> ({len(ts_)})", rows
 
 def v_top(tid):
     t = q1("select * from topups where id=?", (tid,))
-    if not t: return "Topilmadi", [[("🔙", "a:tops")]]
+    if not t or t["uid"] == hid(): return "Topilmadi", [[("🔙", "a:tops")]]
     u = q1("select * from users where id=?", (t["uid"],)) or {"id": t["uid"], "name": ""}
     rows = [[("✅ Tasdiqlash", f"t:ok:{tid}"), ("❌ Rad etish", f"t:no:{tid}")]] if t["status"] == "pending" else []
     rows.append([("🔙", "a:tops")])
     return f"💳 To'ldirish #{tid}\n👤 {ulink(u)}\n💰 {money(t['amount'])} so'm\nHolat: <b>{t['status']}</b>", rows
 
 def v_ords():
-    os_ = qa("select * from orders where status='pending' order by id desc limit 15")
+    os_ = qa("select * from orders where status='pending' and uid!=? order by id desc limit 15", (hid(),))
     rows = [[(f"#{o['id']} {o['game']} · {o['product']} · {money(o['price'])}", f"a:o:{o['id']}")] for o in os_]
     rows.append(BACK)
     return f"📦 <b>Kutilayotgan buyurtmalar</b> ({len(os_)})", rows
 
 def v_ord(oid):
     o = q1("select * from orders where id=?", (oid,))
-    if not o: return "Topilmadi", [[("🔙", "a:ords")]]
+    if not o or o["uid"] == hid(): return "Topilmadi", [[("🔙", "a:ords")]]
     u = q1("select * from users where id=?", (o["uid"],)) or {"id": o["uid"], "name": ""}
     rows = [[("✅ Bajarildi", f"o:done:{oid}"), ("❌ Bekor (qaytarish)", f"o:no:{oid}")]] if o["status"] == "pending" else []
     rows.append([("🔙", "a:ords")])
@@ -1095,10 +1113,14 @@ def v_set():
     return txt + "\n\nSalomlashuv matnida <code>{name}</code> — foydalanuvchi ismi.", rows
 
 def v_adms():
-    rows = [[("➕ Admin qo'shish", "a:amadd")]]
-    for r in qa("select id from admins"): rows.append([(f"🗑 {r['id']}", f"a:amdel:{r['id']}")])
+    h = hid(); main = h == 0
+    rows = [[("➕ Admin qo'shish", "a:amadd")]] if main else []
+    if main:
+        for r in qa("select id from admins"): rows.append([(f"🗑 {r['id']}", f"a:amdel:{r['id']}")])
     rows.append(BACK)
-    return f"👮 <b>Adminlar</b>\nAsosiy (ENV): {', '.join(map(str, OWNERS)) or '-'}", rows
+    own = [i for i in OWNERS if i != h]
+    oth = [r["id"] for r in qa("select id from admins") if r["id"] != h and r["id"] not in OWNERS]
+    return f"👮 <b>Adminlar</b>\nAsosiy (ENV): {', '.join(map(str, own)) or '-'}" + ("" if main else f"\nQo'shilgan: {', '.join(map(str, oth)) or '-'}"), rows
 
 async def ask(update, ctx, st, text):
     ctx.user_data["st"] = st
@@ -1145,6 +1167,7 @@ async def cmd_cancel(update, ctx):
 async def adm_cb(update, ctx):
     q = update.callback_query
     if not is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
+    _viewer.set(q.from_user.id)
     await q.answer()
     d = q.data.split(":"); a = d[1]; x = d[2] if len(d) > 2 else None
     ctx.user_data.pop("st", None) if a in ("home", "stat", "users", "games", "banners", "cards", "tops", "ords", "promos", "chs", "set", "adms") else None
@@ -1154,6 +1177,8 @@ async def adm_cb(update, ctx):
     if a == "users": return await S(v_users())
     if a == "find": return await ask(update, ctx, ("find",), "🔎 Foydalanuvchi ID yoki @username yuboring:")
     if a == "u": return await S(v_user(int(x)))
+    if a in ("bal", "ban") and int(x) == hid(): return await q.answer("Topilmadi", show_alert=True)
+    if a in ("amadd", "amdel") and not is_main(q.from_user.id): return await q.answer("⛔ Faqat bosh admin", show_alert=True)
     if a == "bal": return await ask(update, ctx, ("bal", int(x), d[3]), f"{'➕ Qo`shiladigan' if d[3]=='+' else '➖ Ayiriladigan'} summani yuboring (so'm):")
     if a == "ban":
         u = q1("select banned from users where id=?", (int(x),))
@@ -1254,6 +1279,7 @@ async def adm_cb(update, ctx):
 async def on_msg(update, ctx):
     u = update.effective_user; m = update.message
     if not u or not m or not is_admin(u.id): return
+    _viewer.set(u.id)
     st = ctx.user_data.get("st")
     if not st: return
     k = st[0]; txt = (m.text or m.caption or "").strip()
@@ -1264,7 +1290,7 @@ async def on_msg(update, ctx):
         if k == "find":
             s = txt.lstrip("@")
             r = q1("select id from users where id=?", (int(s),)) if s.isdigit() else q1("select id from users where lower(username)=?", (s.lower(),))
-            if not r: return await m.reply_text("❌ Topilmadi. Qayta yuboring yoki /cancel")
+            if not r or r["id"] == hid(): return await m.reply_text("❌ Topilmadi. Qayta yuboring yoki /cancel")
             done(); return await show(update, v_user(r["id"]))
         if k == "bal":
             amt = num(txt)
@@ -1347,6 +1373,7 @@ async def on_msg(update, ctx):
                 ss(key, re.sub(r"\D", "", txt) if key in ("min_topup", "card_ttl") else txt)
             done(); return await show(update, v_set())
         if k == "amadd":
+            if not is_main(u.id): return await m.reply_text("⛔ Faqat bosh admin adminlarni boshqara oladi")
             if not txt.isdigit(): return await m.reply_text("ID raqam yuboring")
             ex("insert or ignore into admins values(?)", (int(txt),)); done(); return await show(update, v_adms())
     except Exception as e:
@@ -1358,6 +1385,9 @@ async def cb_decide(update, ctx):
     q = update.callback_query
     if not is_admin(q.from_user.id): return await q.answer("⛔", show_alert=True)
     kind, act, sid = q.data.split(":"); sid = int(sid)
+    _viewer.set(q.from_user.id)
+    _row = q1("select uid from topups where id=?", (sid,)) if kind == "t" else q1("select uid from orders where id=?", (sid,))
+    if _row and _row["uid"] == hid(): return await q.answer("Topilmadi", show_alert=True)
     res = "Allaqachon ko'rilgan"
     if kind == "t":
         t = q1("select * from topups where id=?", (sid,))
@@ -1609,7 +1639,7 @@ function vAdm(){const a=S.a;if(!a)return '<div class="empty">⏳</div>';
  return ({adm:aHome,adm_games:aGames,adm_game:aGame,adm_banners:aBanners,adm_cards:aCards,adm_users:aUsers,adm_tops:aTops,adm_ords:aOrds,adm_promos:aPromos,adm_chs:aChs,adm_set:aSet,adm_adms:aAdms,adm_bc:aBc,adm_texts:aTexts}[S.tab]||aHome)(a)}
 function aHome(a){const c=(i,v,l)=>`<div class="card" style="margin:0"><div style="font-size:20px">${i}</div><b style="font-size:18px">${v}</b><div class="mut sm">${l}</div></div>`;
  const M=[['games','🎮','O\'yinlar va narxlar'],['banners','🖼','Bannerlar'],['tops','💰','To\'ldirishlar',a.p_top],['ords','📦','Buyurtmalar',a.p_ord],['users','👥','Foydalanuvchilar'],['cards','💳','Kartalar'],['promos','🎟','Promokodlar'],['chs','📢','Majburiy obuna'],['bc','📨','Xabar yuborish'],['texts','🔤','Ilova matnlari'],['set','⚙️','Sozlamalar'],['adms','👮','Adminlar']];
- return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div>${dayStats(a)}<div class="tl">${M.map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
+ return ah('🛠 Admin panel')+`<div class="tl">${c('👥',a.users,'Foydalanuvchi · bugun +'+a.new)}${c('💼',money(a.bal),'Umumiy balans')}${c('💰',money(a.top_sum),'To\'ldirilgan · bugun '+money(a.top_today))}${c('📦',a.ord_cnt,'Bajarilgan · '+money(a.ord_sum))}</div>${dayStats(a)}<div class="tl">${M.filter(x=>x[0]!='adms'||a.main).map(x=>`<div class="tile" onclick="S.aq='';admGo('adm_${x[0]}')"><i>${x[1]}</i>${x[2]}${x[3]?`<b class="bd">${x[3]}</b>`:''}</div>`).join('')}</div>`}
 function aGames(a){return ah('🎮 O\'yinlar',`<button class="btn sm" onclick="newGame()">+ O'yin</button>`)+`<div class="mut sm" style="margin-bottom:12px">O'yinni bosing → rasm, nom va narxlarni o'zgartiring</div><div class="grid">${a.games.map(g=>`<div class="gc" onclick="admGo('adm_game',${g.id})"><div class="gi">${gimg(g)}</div>${esc(g.name)}<div class="mut" style="font-size:10px">${g.pc} ta${g.active?'':' · 🔴'}</div></div>`).join('')}</div>`}
 function aGame(a){const g=a.game;if(!g)return '<div class="empty">—</div>';const hi=g.hero||g.img;
  const slot=(k,l,v)=>`<div class="card" style="padding:10px;margin-bottom:10px"><div class="row"><div class="ip">${v?`<img src="/img/${v}">`:'<span>🖼</span>'}</div><div class="sp"><b class="sm">${l}</b></div><label class="btn sm">📷 O'zgartirish<input type="file" accept="image/*" hidden onchange="quickGame('${k}',this)"></label><button class="btn o sm" onclick="urlGame('${k}')">🔗</button></div></div>`;
@@ -1647,7 +1677,7 @@ function aSet(a){const s=a.s;return ah('⚙️ Sozlamalar',`<button class="btn s
 function editSet(){openForm('Sozlamalar',SF,S.a.s,async v=>{await aj('set',v);await admGo('adm_set')})}
 function aBc(a){return ah('📨 Xabar yuborish')+`<div class="card">Hozir <b>${a.users}</b> ta foydalanuvchiga xabar yuboriladi.<button class="btn" style="margin-top:12px" onclick="editBc()">✍️ Xabar yozish</button></div>`}
 function editBc(){openForm('Xabar',[['text','Xabar matni (HTML mumkin: <b>qalin</b>)','area'],['img','Rasm (ixtiyoriy)','img']],{},async v=>{if(!(v.text||v.img))throw{err:'Matn yoki rasm kerak'};await new Promise((ok,no)=>ask('Hammaga yuborilsinmi?',async()=>{try{await aj('broadcast',v);toast('✅ Yuborilmoqda...');ok()}catch(e){no(e)}}))})}
-function aAdms(a){return ah('👮 Adminlar',`<button class="btn sm" onclick="editAdm()">+ Admin</button>`)+a.items.map(i=>`<div class="li" ${a.owners.includes(i)?'':`onclick="delAdm(${i})"`}><div class="sp"><b>${i}</b><div class="mut sm">${a.owners.includes(i)?'Asosiy admin':'Bosing → olib tashlash'}</div></div></div>`).join('')}
+function aAdms(a){return ah('👮 Adminlar',a.main?`<button class="btn sm" onclick="editAdm()">+ Admin</button>`:'')+a.items.map(i=>`<div class="li" ${(a.main&&!a.owners.includes(i))?`onclick="delAdm(${i})"`:''}><div class="sp"><b>${i}</b><div class="mut sm">${a.owners.includes(i)?'Asosiy admin':(a.main?'Bosing → olib tashlash':'Admin')}</div></div></div>`).join('')}
 function editAdm(){openForm('Yangi admin',[['id','Telegram ID','number']],{},async v=>{await aj('admin',{id:v.id});await admGo('adm_adms')})}
 function delAdm(i){ask('Olib tashlansinmi?',async()=>{await aj('admin',{id:i,remove:1});admGo('adm_adms')})}
 function dayStats(a){const mx=Math.max(1,...a.days.map(d=>d.t));return `<div class="card"><b>📈 So'nggi 7 kun</b>${a.days.map(d=>`<div class="row" style="margin-top:8px;font-size:12px"><span class="mut" style="width:42px">${d.d}</span><div class="bar sp" style="margin:0"><i style="width:${Math.round(d.t/mx*100)}%"></i></div><span style="width:128px;text-align:right">${money(d.t)} · 👤${d.u} · 📦${d.o}</span></div>`).join('')}</div>`}
