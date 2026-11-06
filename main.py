@@ -4,7 +4,7 @@ SYREXA - o'yin to'ldirish do'koni (Telegram bot + Mini App + to'liq admin panel)
 Bitta fayl. Render.com uchun tayyor.
 
 ENV (Render > Environment):
-  BOT_TOKEN   - BotFather tokeni
+  BOT_TOKEN   - BotFat
   ADMIN_IDS   - admin Telegram ID lari, vergul bilan: 123456789,987654321
   DB_PATH     - (ixtiyoriy) masalan /data/syrexa.db  (Render Disk ulangan bo'lsa)
 requirements.txt:
@@ -16,7 +16,7 @@ Start command:  python main.py
 import contextvars, os, re, json, base64, time, hmac, html, random, sqlite3, hashlib, asyncio, logging, threading, functools, urllib.parse
 from datetime import datetime
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jso
 from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, MenuButtonWebApp)
 from telegram.error import BadRequest
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters)
